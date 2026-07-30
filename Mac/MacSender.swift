@@ -214,6 +214,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Input latency: touches arrive stamped in our clock (the phone applies
     // its sync offset); delta to now = network + deframe + dispatch.
     private var inputLatencies: [Double] = []
+    // Control message types we've already warned about, so an unrecognized
+    // type logs once per session instead of once per message. Only touched
+    // from `handleControl`, which runs on `queue`, so no locking needed.
+    private var loggedUnknownTypes: Set<String> = []
     // Capture cadence: SCK only emits on content change, so the phone can't
     // tell "Mac rendered 45fps" from "frames got lost" — count deliveries here.
     private var capFrames = 0
@@ -1017,7 +1021,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             Log.info("receiver app closed — ending session")
             Task { @MainActor in self.onPeerClosed?() }
         default:
-            Log.info("unknown control message type: \(type)")
+            // Unknown types are a normal consequence of the additive wire
+            // protocol: a newer peer can send messages this build predates.
+            // Log each type once per session, never per message — `Log.info`
+            // opens/writes/closes the log file per call, and a peer can drive
+            // this at input rates (a pencil stroke is ~240 messages/sec), which
+            // would turn "message I don't understand" into hundreds of file IO
+            // round-trips a second. The cap bounds both memory and log volume
+            // against a peer sending endless distinct types.
+            if loggedUnknownTypes.count < 16, loggedUnknownTypes.insert(type).inserted {
+                Log.info("unknown control message type: \(type) — ignoring (logged once)")
+            }
         }
     }
 
