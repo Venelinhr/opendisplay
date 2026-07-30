@@ -218,6 +218,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // type logs once per session instead of once per message. Only touched
     // from `handleControl`, which runs on `queue`, so no locking needed.
     private var loggedUnknownTypes: Set<String> = []
+    // Encode failures repeat every frame once the session goes bad; throttle
+    // the log to one line a second and carry the count. Guarded by
+    // `pipelineLock` alongside the other pipeline counters.
+    private var encodeFailuresSinceLog = 0
+    private var lastEncodeFailureLog = Date.distantPast
     // Capture cadence: SCK only emits on content change, so the phone can't
     // tell "Mac rendered 45fps" from "frames got lost" — count deliveries here.
     private var capFrames = 0
@@ -1177,8 +1182,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         if submitStatus != noErr {
             pipelineLock.lock()
             pendingEncodes = max(0, pendingEncodes - 1)
+            // A dead encoder session keeps failing, and this runs per frame, so
+            // an unthrottled line here is ~60/sec for as long as the problem
+            // lasts. Report at most once a second and carry the count: the
+            // status code is the diagnosis, the rate is just a number.
+            encodeFailuresSinceLog += 1
+            let now = Date()
+            let shouldReport = now.timeIntervalSince(lastEncodeFailureLog) >= 1
+            let failures = encodeFailuresSinceLog
+            if shouldReport {
+                lastEncodeFailureLog = now
+                encodeFailuresSinceLog = 0
+            }
             pipelineLock.unlock()
-            Log.info("VTCompressionSessionEncodeFrame failed: \(submitStatus)")
+            if shouldReport {
+                Log.info("VTCompressionSessionEncodeFrame failed: \(submitStatus) (\(failures) since last report)")
+            }
         }
     }
 
