@@ -28,9 +28,19 @@ struct UnknownControlTypeLogPolicy {
     }
 }
 
-struct ThrottledFailureLogPolicy {
+/// Rate-limits a log line that a broken peer or a dead pipeline can trigger on
+/// every frame or every message. The first occurrence reports immediately, then
+/// at most one report per `interval` carrying how many occurrences it stands for
+/// and the detail from the most recent one.
+///
+/// `Detail` is whatever identifies the occurrence: an `OSStatus` for an encoder
+/// failure, a byte count for a message that would not parse. The policy is a
+/// pure value type and never schedules anything itself; it returns `.schedule`
+/// and the caller owns the timer, which keeps it testable without waiting on
+/// real time.
+struct ThrottledLogPolicy<Detail: Equatable> {
     struct Report: Equatable {
-        let status: Int32
+        let detail: Detail
         let count: Int
     }
 
@@ -42,8 +52,7 @@ struct ThrottledFailureLogPolicy {
 
     private let interval: TimeInterval
     private var lastReportAt: TimeInterval?
-    private var pendingCount = 0
-    private var latestStatus: Int32 = 0
+    private var pending: Report?
     private var reportScheduled = false
 
     init(interval: TimeInterval = 1) {
@@ -51,30 +60,33 @@ struct ThrottledFailureLogPolicy {
         self.interval = interval
     }
 
-    mutating func record(status: Int32, at time: TimeInterval) -> Action {
-        pendingCount += 1
-        latestStatus = status
+    mutating func record(_ detail: Detail, at time: TimeInterval) -> Action {
+        let report = Report(detail: detail, count: (pending?.count ?? 0) + 1)
+        pending = report
 
         guard let lastReportAt else {
-            return .report(takeReport(at: time))
+            return .report(take(report, at: time))
         }
         if !reportScheduled, time - lastReportAt >= interval {
-            return .report(takeReport(at: time))
+            return .report(take(report, at: time))
         }
+        // A flush is already queued for the end of this window; it will carry
+        // everything recorded since, so there is nothing to ask of the caller.
         guard !reportScheduled else { return .none }
         reportScheduled = true
         return .schedule(after: max(0, lastReportAt + interval - time))
     }
 
+    /// Reports whatever accumulated since the last report, for the caller's
+    /// scheduled flush. Nil when a report already drained the window.
     mutating func flush(at time: TimeInterval) -> Report? {
         reportScheduled = false
-        guard pendingCount > 0 else { return nil }
-        return takeReport(at: time)
+        guard let pending else { return nil }
+        return take(pending, at: time)
     }
 
-    private mutating func takeReport(at time: TimeInterval) -> Report {
-        let report = Report(status: latestStatus, count: pendingCount)
-        pendingCount = 0
+    private mutating func take(_ report: Report, at time: TimeInterval) -> Report {
+        pending = nil
         lastReportAt = time
         return report
     }
