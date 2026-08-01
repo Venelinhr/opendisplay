@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 
 /// Appends timestamped lines to a log file (and stdout) so the stream can be
@@ -24,12 +25,6 @@ enum Log {
         return library.appendingPathComponent("Logs/OpenDisplay", isDirectory: true)
     }()
 
-    static let fileURL = directory.appendingPathComponent("opendisplay.log")
-    /// One generation back, so a rotation mid-incident doesn't leave us with an
-    /// almost-empty file and no history. Named so the order reads at a glance
-    /// in Finder, since users will be sending both.
-    private static let rotatedURL = directory.appendingPathComponent("opendisplay-previous.log")
-
     /// Sized from the steady-state rate: an active session logs one aggregated
     /// PHONE-STATS line (~256 bytes) every 5s, so ~180 KB per streaming hour.
     /// 8MB is therefore ~45 hours of active streaming in the live file alone,
@@ -38,23 +33,23 @@ enum Log {
     private static let maxBytes: UInt64 = 8 * 1024 * 1024
 
     private static let queue = DispatchQueue(label: "log")
+    private static let writer = RotatingLogFile(
+        directory: directory,
+        baseName: "opendisplay",
+        maxBytes: maxBytes
+    )
+    static let fileURL = writer.fileURL
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SSS"
         return f
     }()
 
-    // Both only touched inside `queue`, which is serial, so no locking.
-    // The handle is held open across lines: reopening per line costs ~22us
-    // against ~1us for a write to a live handle.
-    private static var handle: FileHandle?
-    private static var written: UInt64 = 0
-
     static func info(_ message: String) {
         let line = "[\(formatter.string(from: Date()))] \(message)\n"
         print(line, terminator: "")
         guard let data = line.data(using: .utf8) else { return }
-        queue.async { append(data) }
+        queue.async { writer.append(data) }
     }
 
     /// Shows the log files in Finder, for "send me your logs" support requests.
@@ -62,10 +57,7 @@ enum Log {
     /// the user grabs the file.
     static func revealInFinder() {
         queue.async {
-            if handle == nil { openLog() }
-            let existing = [fileURL, rotatedURL].filter {
-                FileManager.default.fileExists(atPath: $0.path)
-            }
+            let existing = writer.existingFiles()
             DispatchQueue.main.async {
                 if existing.isEmpty {
                     // Nothing logged yet; still open the folder so the user
@@ -77,45 +69,186 @@ enum Log {
             }
         }
     }
+}
 
-    private static func append(_ data: Data) {
-        if handle == nil { openLog() }
-        if written + UInt64(data.count) > maxBytes { rotate() }
-        guard let handle else { return }
-        do {
-            try handle.write(contentsOf: data)
-            written += UInt64(data.count)
-        } catch {
-            // The file was removed underneath us or the volume went away. Drop
-            // the handle so the next line reopens instead of every subsequent
-            // write failing forever.
-            try? handle.close()
-            Log.handle = nil
+/// Stateful file sink behind `Log`. Calls are serialized by `Log.queue` in the
+/// app; keeping the sink synchronous also makes its filesystem behavior
+/// directly testable.
+final class RotatingLogFile {
+    typealias ErrorReporter = (String) -> Void
+    private static let processLock = NSLock()
+
+    let directory: URL
+    let fileURL: URL
+    let rotatedURL: URL
+    let maxBytes: UInt64
+
+    private let lockURL: URL
+    private let fileManager: FileManager
+    private let reportError: ErrorReporter
+    private var handle: FileHandle?
+    private var lockHandle: FileHandle?
+
+    init(
+        directory: URL,
+        baseName: String,
+        maxBytes: UInt64,
+        fileManager: FileManager = .default,
+        reportError: @escaping ErrorReporter = RotatingLogFile.reportToStandardError
+    ) {
+        precondition(maxBytes > 0)
+        self.directory = directory
+        fileURL = directory.appendingPathComponent("\(baseName).log")
+        rotatedURL = directory.appendingPathComponent("\(baseName)-previous.log")
+        lockURL = directory.appendingPathComponent(".\(baseName).lock")
+        self.maxBytes = maxBytes
+        self.fileManager = fileManager
+        self.reportError = reportError
+    }
+
+    deinit {
+        try? handle?.close()
+        try? lockHandle?.close()
+    }
+
+    // The handle is held open across lines: reopening per line costs ~22us
+    // against ~1us for a write to a live handle. Calls on one instance must be
+    // serialized; the lock below coordinates separate app processes.
+    func append(_ data: Data) {
+        let payload: Data
+        if UInt64(data.count) > maxBytes {
+            payload = Data(data.suffix(Int(maxBytes)))
+            reportError("entry exceeded the log cap; only its newest \(maxBytes) bytes were kept")
+        } else {
+            payload = data
+        }
+
+        withExclusiveLock {
+            do {
+                var opened = try currentHandle()
+                let size = try opened.seekToEnd()
+                if size > maxBytes - UInt64(payload.count) {
+                    try rotate()
+                    opened = try currentHandle()
+                    _ = try opened.seekToEnd()
+                }
+                try opened.write(contentsOf: payload)
+            } catch {
+                closeCurrentHandle()
+                reportError("could not append to \(fileURL.path): \(error.localizedDescription)")
+            }
         }
     }
 
-    private static func openLog() {
-        let fm = FileManager.default
-        try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
-        if !fm.fileExists(atPath: fileURL.path) {
-            fm.createFile(atPath: fileURL.path, contents: nil)
+    func existingFiles() -> [URL] {
+        var existing: [URL] = []
+        withExclusiveLock {
+            do {
+                _ = try currentHandle()
+                existing = [fileURL, rotatedURL].filter {
+                    fileManager.fileExists(atPath: $0.path)
+                }
+            } catch {
+                reportError("could not prepare logs for Finder: \(error.localizedDescription)")
+            }
         }
-        guard let opened = FileHandle(forWritingAtPath: fileURL.path) else {
-            handle = nil
-            written = 0
+        return existing
+    }
+
+    private func currentHandle() throws -> FileHandle {
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        if let handle, handlePointsToURL(handle, fileURL) {
+            return handle
+        }
+        closeCurrentHandle()
+        if !fileManager.fileExists(atPath: fileURL.path) {
+            let created = fileManager.createFile(atPath: fileURL.path, contents: nil)
+            guard created || fileManager.fileExists(atPath: fileURL.path) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        }
+        let opened = try FileHandle(forWritingTo: fileURL)
+        handle = opened
+        return opened
+    }
+
+    private func rotate() throws {
+        closeCurrentHandle()
+        do {
+            if fileManager.fileExists(atPath: rotatedURL.path) {
+                _ = try fileManager.replaceItemAt(rotatedURL, withItemAt: fileURL)
+            } else {
+                try fileManager.moveItem(at: fileURL, to: rotatedURL)
+            }
+        } catch {
+            reportError("could not rotate \(fileURL.path): \(error.localizedDescription)")
+            // Keep the disk bound even when generation replacement fails. If
+            // the live file survived, truncate it so the newest entries win.
+            let opened = try currentHandle()
+            try opened.truncate(atOffset: 0)
+        }
+        _ = try currentHandle()
+    }
+
+    private func withExclusiveLock(_ body: () -> Void) {
+        Self.processLock.lock()
+        defer { Self.processLock.unlock() }
+
+        let opened: FileHandle
+        do {
+            opened = try currentLockHandle()
+        } catch {
+            reportError("could not open the log lock: \(error.localizedDescription)")
             return
         }
-        handle = opened
-        // Append to whatever a previous run left behind.
-        written = (try? opened.seekToEnd()) ?? 0
+
+        guard ODLockFile(opened.fileDescriptor) == 0 else {
+            reportError("could not lock the log: \(Self.currentPOSIXError())")
+            return
+        }
+        defer {
+            if ODUnlockFile(opened.fileDescriptor) != 0 {
+                reportError("could not unlock the log: \(Self.currentPOSIXError())")
+            }
+        }
+        body()
     }
 
-    private static func rotate() {
+    private func currentLockHandle() throws -> FileHandle {
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        if let lockHandle, handlePointsToURL(lockHandle, lockURL) {
+            return lockHandle
+        }
+        try? lockHandle?.close()
+        lockHandle = nil
+        if !fileManager.fileExists(atPath: lockURL.path) {
+            let created = fileManager.createFile(atPath: lockURL.path, contents: nil)
+            guard created || fileManager.fileExists(atPath: lockURL.path) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        }
+        let opened = try FileHandle(forUpdating: lockURL)
+        lockHandle = opened
+        return opened
+    }
+
+    private func handlePointsToURL(_ handle: FileHandle, _ url: URL) -> Bool {
+        url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return false }
+            return ODFileDescriptorPointsToPath(handle.fileDescriptor, path)
+        }
+    }
+
+    private func closeCurrentHandle() {
         try? handle?.close()
         handle = nil
-        let fm = FileManager.default
-        try? fm.removeItem(at: rotatedURL)
-        try? fm.moveItem(at: fileURL, to: rotatedURL)
-        openLog()
+    }
+
+    private static func currentPOSIXError() -> String {
+        String(cString: strerror(errno))
+    }
+
+    private static func reportToStandardError(_ message: String) {
+        try? FileHandle.standardError.write(contentsOf: Data("OpenDisplay log: \(message)\n".utf8))
     }
 }
