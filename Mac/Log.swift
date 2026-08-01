@@ -19,7 +19,7 @@ enum Log {
     /// someone tries before filing a bug, so a log there is gone exactly when
     /// it's wanted. Living here also means Console.app lists it under Log
     /// Reports without us doing anything.
-    static let directory: URL = {
+    private static let directory: URL = {
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library")
         return library.appendingPathComponent("Logs/OpenDisplay", isDirectory: true)
@@ -38,7 +38,6 @@ enum Log {
         baseName: "opendisplay",
         maxBytes: maxBytes
     )
-    static let fileURL = writer.fileURL
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SSS"
@@ -60,8 +59,8 @@ enum Log {
             let existing = writer.existingFiles()
             DispatchQueue.main.async {
                 if existing.isEmpty {
-                    // Nothing logged yet; still open the folder so the user
-                    // isn't left staring at a menu item that did nothing.
+                    // The writer could not reach the files. Open the folder
+                    // anyway so the menu item never appears to do nothing.
                     NSWorkspace.shared.open(directory)
                 } else {
                     NSWorkspace.shared.activateFileViewerSelecting(existing)
