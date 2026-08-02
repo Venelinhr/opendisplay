@@ -54,6 +54,11 @@ final class PhoneReceiver: ObservableObject {
     // Compatibility signal from the connected Mac (issue #132). Nil = no signal.
     // Merged into the update gate by ReceiverScreen.
     @Published var peerSignal: PeerUpdateSignal?
+    /// Mac protocol version from the most recent `welcome` message.
+    @Published private(set) var macProtocolVersion = WireProtocol.assumedWhenAbsent
+
+    /// True when the connected Mac understands pencil/proximity wire messages.
+    var macSupportsPencilWire: Bool { macProtocolVersion >= WireProtocol.pencilWireVersion }
 
     private var listener: NWListener?
     private var listenerHealthy = false
@@ -438,6 +443,9 @@ final class PhoneReceiver: ObservableObject {
             // older than we support, it's the Mac that needs updating — and an
             // old Mac can't diagnose that itself, so we surface it here.
             let macPV = obj["pv"] as? Int ?? WireProtocol.assumedWhenAbsent
+            DispatchQueue.main.async {
+                self.macProtocolVersion = macPV
+            }
             if macPV < WireProtocol.minSupportedPeer {
                 let msg = "The OpenDisplay app on your Mac is too old for this \(deviceKind) app. Update OpenDisplay on your Mac to reconnect."
                 DispatchQueue.main.async { self.peerSignal = .updateMac(message: msg) }
@@ -511,6 +519,27 @@ final class PhoneReceiver: ObservableObject {
     /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
     func sendScroll(dx: Double, dy: Double) {
         sendControl(["type": "scroll", "dx": dx, "dy": dy])
+    }
+
+    /// Apple Pencil stroke/hover. azimuth and altitude are radians.
+    /// rotation is always 0 until Apple Pencil Pro barrel roll is wired up.
+    func sendPencil(phase: String, x: Double, y: Double,
+                    pressure: Double, azimuth: Double, altitude: Double) {
+        var msg: [String: Any] = [
+            "type": "pencil",
+            "phase": phase,
+            "x": x, "y": y,
+            "pressure": pressure,
+            "azimuth": azimuth,
+            "altitude": altitude,
+            "rotation": 0,   // TODO: UIKit rollAngle once Pencil Pro is available
+        ]
+        if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
+        sendControl(msg)
+    }
+
+    func sendProximity(entering: Bool, x: Double, y: Double) {
+        sendControl(["type": "proximity", "entering": entering, "x": x, "y": y])
     }
 
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
@@ -919,7 +948,12 @@ final class PhoneReceiver: ObservableObject {
     }
 
     private func setConnected(_ value: Bool) {
-        DispatchQueue.main.async { self.connected = value }
+        DispatchQueue.main.async {
+            self.connected = value
+            if !value {
+                self.macProtocolVersion = WireProtocol.assumedWhenAbsent
+            }
+        }
         if !value { setStatus("Listening on :9000") }
         else {
             setStatus("Connected")

@@ -108,8 +108,7 @@ targets:
   OpenSidecariOS:
     type: application
     platform: iOS
-    # See issue #72 for further details.
-    deploymentTarget: "16.0"
+    deploymentTarget: "16.4"
     sources:
       - iOS
       - Shared

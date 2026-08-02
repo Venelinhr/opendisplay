@@ -712,6 +712,23 @@ final class ReceiverModel: ObservableObject {
     }
 }
 
+// MARK: - Touch sampling
+
+extension UIEvent {
+    /// Every position UIKit recorded for `touch` in this update, oldest first.
+    ///
+    /// The panel samples faster than UIKit delivers, so a single `touchesMoved`
+    /// stands for several real positions. This batch is that whole history and
+    /// its *last* entry is `touch` itself, so forward the list as it comes:
+    /// sending `touch` alongside it puts the newest sample ahead of its own
+    /// history and emits it twice, which reads as backtracking on fast strokes.
+    /// Falls back to the touch alone when UIKit coalesced nothing.
+    func samples(for touch: UITouch) -> [UITouch] {
+        let batch = coalescedTouches(for: touch) ?? []
+        return batch.isEmpty ? [touch] : batch
+    }
+}
+
 // MARK: - Video layer host view
 
 /// UIView whose backing layer is the AVSampleBufferDisplayLayer.
@@ -744,6 +761,17 @@ struct VideoLayerView: UIViewRepresentable {
             view.layer.addSublayer(displayLayer)
         }
 
+        view.inputEngine.normalize = { [weak view] point in view?.normalized(point) }
+        view.inputEngine.onPencil = { [weak receiver] phase, x, y, pressure, azimuth, altitude in
+            receiver?.sendPencil(phase: phase, x: x, y: y,
+                                 pressure: pressure, azimuth: azimuth,
+                                 altitude: altitude)
+        }
+        view.inputEngine.onProximity = { [weak receiver] entering, x, y in
+            receiver?.sendProximity(entering: entering, x: x, y: y)
+        }
+        view.inputEngine.install(on: view)
+
         let pan = UIPanGestureRecognizer(target: view, action: #selector(VideoView.didTwoFingerPan(_:)))
         pan.minimumNumberOfTouches = 2
         pan.maximumNumberOfTouches = 2
@@ -768,6 +796,7 @@ struct VideoLayerView: UIViewRepresentable {
     final class VideoView: UIView {
         weak var receiver: PhoneReceiver?
         var metalRenderer: MetalVideoRenderer?
+        let inputEngine = InputCaptureEngine()
 
         private let cursorLayer: CALayer = {
             let layer = CALayer()
@@ -854,7 +883,7 @@ struct VideoLayerView: UIViewRepresentable {
 
         // The video is aspect-fit inside the view; map view coords into the
         // displayed video rect and normalize to [0,1].
-        private func normalized(_ point: CGPoint) -> (x: Double, y: Double)? {
+        fileprivate func normalized(_ point: CGPoint) -> (x: Double, y: Double)? {
             guard let video = receiver?.videoSize, video != .zero,
                   bounds.width > 0, bounds.height > 0 else { return nil }
             let scale = min(bounds.width / video.width, bounds.height / video.height)
@@ -864,6 +893,17 @@ struct VideoLayerView: UIViewRepresentable {
             let x = (point.x - origin.x) / size.width
             let y = (point.y - origin.y) / size.height
             return (min(max(x, 0), 1), min(max(y, 0), 1))
+        }
+
+        private func isFinger(_ touch: UITouch) -> Bool {
+            switch touch.type {
+            case .direct, .indirectPointer: return true
+            default: return false
+            }
+        }
+
+        private func isPencil(_ touch: UITouch) -> Bool {
+            touch.type == .pencil
         }
 
         private var twoFingerActive = false
@@ -936,16 +976,18 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         private func send(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
+            let fingers = touches.filter { isFinger($0) }
+            guard !fingers.isEmpty else { return }
             // Ignore single-finger events while a two-finger gesture runs,
             // and end the click if a second finger joins mid-press.
-            if twoFingerActive || (event?.allTouches?.count ?? 1) > 1 {
+            if twoFingerActive || (event?.allTouches?.filter { isFinger($0) }.count ?? 1) > 1 {
                 if downSent {
                     receiver?.sendTouch(phase: "cancelled", x: lastNorm.x, y: lastNorm.y)
                 }
                 discardPendingDown()
                 return
             }
-            guard let touch = touches.first,
+            guard let touch = fingers.first,
                   let norm = normalized(touch.location(in: self)) else { return }
             lastNorm = norm
 
@@ -987,12 +1029,11 @@ struct VideoLayerView: UIViewRepresentable {
             }
 
             if phase == "moved", let event {
-                // The panel samples touches at 120Hz but UIKit delivers at
-                // display refresh — forward every coalesced sample so the Mac
-                // gets the full-rate drag, then UIKit's predicted touch so the
-                // cursor leads toward where the finger will be (~1 frame of
-                // perceived latency back; corrected by the next real sample).
-                for t in event.coalescedTouches(for: touch) ?? [touch] {
+                // Forward every coalesced sample so the Mac gets the full-rate
+                // drag, then UIKit's predicted touch so the cursor leads toward
+                // where the finger will be (~1 frame of perceived latency back;
+                // corrected by the next real sample).
+                for t in event.samples(for: touch) {
                     if let n = normalized(t.location(in: self)) {
                         lastNorm = n
                         receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
@@ -1007,9 +1048,166 @@ struct VideoLayerView: UIViewRepresentable {
             receiver?.sendTouch(phase: phase, x: norm.x, y: norm.y)
         }
 
-        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) { send("began", touches, event) }
-        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) { send("moved", touches, event) }
-        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { send("ended", touches, event) }
-        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { send("cancelled", touches, event) }
+        private func sendPencilAsTouch(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
+            guard let touch = touches.first,
+                  let norm = normalized(touch.location(in: self)) else { return }
+            lastNorm = norm
+            if phase == "moved", let event {
+                for t in event.samples(for: touch) {
+                    if let n = normalized(t.location(in: self)) {
+                        lastNorm = n
+                        receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
+                    }
+                }
+                if let predicted = event.predictedTouches(for: touch)?.last,
+                   let n = normalized(predicted.location(in: self)) {
+                    receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
+                }
+                return
+            }
+            receiver?.sendTouch(phase: phase, x: norm.x, y: norm.y)
+        }
+
+        private func routeTouches(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?, ended: Bool) {
+            let pencil = touches.filter { isPencil($0) }
+            let finger = touches.filter { isFinger($0) }
+            let usePencilWire = receiver?.macSupportsPencilWire ?? false
+
+            if !pencil.isEmpty {
+                if usePencilWire {
+                    inputEngine.handle(pencil, event: event, ended: ended)
+                } else {
+                    sendPencilAsTouch(phase, pencil, event)
+                }
+            }
+            // Palm rejection: ignore resting fingers while the pen is down.
+            if !finger.isEmpty && !inputEngine.hasActivePen {
+                send(phase, finger, event)
+            }
+        }
+
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            routeTouches("began", touches, event, ended: false)
+        }
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+            routeTouches("moved", touches, event, ended: false)
+        }
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+            routeTouches("ended", touches, event, ended: true)
+        }
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+            routeTouches("cancelled", touches, event, ended: true)
+        }
+    }
+}
+
+// MARK: - Apple Pencil capture
+
+/// Captures Apple Pencil hover and stroke on a host view.
+/// Finger touches stay on VideoView's existing `touch` wire path.
+///
+/// TODO: Capture Apple Pencil Pro barrel roll (UIKit rollAngle, iOS 17.5+) once
+/// hardware is available for testing.
+final class InputCaptureEngine: NSObject {
+    var onPencil: ((_ phase: String, _ x: Double, _ y: Double,
+                    _ pressure: Double, _ azimuth: Double, _ altitude: Double) -> Void)?
+    var onProximity: ((_ entering: Bool, _ x: Double, _ y: Double) -> Void)?
+
+    /// True while at least one pen contact is on the glass (palm rejection).
+    var hasActivePen: Bool { !activePens.isEmpty }
+
+    /// Map a point in the host view to normalized video coordinates.
+    var normalize: ((CGPoint) -> (x: Double, y: Double)?)?
+
+    private weak var hostView: UIView?
+    private var activePens: Set<UInt64> = []
+    private var proximityActive = false
+
+    func install(on view: UIView) {
+        hostView = view
+        view.isMultipleTouchEnabled = true
+
+        let hover = UIHoverGestureRecognizer(target: self, action: #selector(hoverChanged(_:)))
+        hover.allowedTouchTypes = [UITouch.TouchType.pencil.rawValue as NSNumber]
+        view.addGestureRecognizer(hover)
+    }
+
+    @objc private func hoverChanged(_ gr: UIHoverGestureRecognizer) {
+        guard activePens.isEmpty, let view = hostView else { return }
+        guard let n = normalize?(gr.location(in: view)) else { return }
+        switch gr.state {
+        case .began:
+            openProximity(x: n.x, y: n.y)
+            fallthrough
+        case .changed:
+            let azimuth = Double(gr.azimuthAngle(in: view))
+            let altitude = Double(gr.altitudeAngle)
+            onPencil?("hover", n.x, n.y, 0, azimuth, altitude)
+        case .ended, .cancelled, .failed:
+            guard activePens.isEmpty else { return }
+            closeProximity(x: n.x, y: n.y)
+        default:
+            break
+        }
+    }
+
+    func handle(_ touches: Set<UITouch>, event: UIEvent?, ended: Bool) {
+        guard hostView != nil else { return }
+        for touch in touches where touch.type == .pencil {
+            emitPen(touch, event: event, ended: ended)
+        }
+    }
+
+    private func openProximity(x: Double, y: Double) {
+        guard !proximityActive else { return }
+        proximityActive = true
+        onProximity?(true, x, y)
+    }
+
+    private func closeProximity(x: Double, y: Double) {
+        guard proximityActive else { return }
+        proximityActive = false
+        onProximity?(false, x, y)
+    }
+
+    private func emitPen(_ touch: UITouch, event: UIEvent?, ended: Bool) {
+        guard let view = hostView else { return }
+        let id = UInt64(bitPattern: Int64(ObjectIdentifier(touch).hashValue))
+        let loc = touch.location(in: view)
+        guard let n = normalize?(loc) else { return }
+        let (nx, ny) = (n.x, n.y)
+
+        let pressure = min(Double(touch.force), 1.0)
+        let azimuth = Double(touch.azimuthAngle(in: view))
+        let altitude = Double(touch.altitudeAngle)
+
+        if !ended && !activePens.contains(id) {
+            activePens.insert(id)
+            openProximity(x: nx, y: ny)
+            emitPencil("down", x: nx, y: ny, pressure: pressure,
+                       azimuth: azimuth, altitude: altitude)
+            return
+        }
+
+        if !ended {
+            for c in event?.samples(for: touch) ?? [touch] {
+                guard let cn = normalize?(c.location(in: view)) else { continue }
+                emitPencil("move", x: cn.x, y: cn.y,
+                           pressure: min(Double(c.force), 1.0),
+                           azimuth: Double(c.azimuthAngle(in: view)),
+                           altitude: Double(c.altitudeAngle))
+            }
+            return
+        }
+
+        defer { activePens.remove(id) }
+        emitPencil("up", x: nx, y: ny, pressure: 0,
+                   azimuth: azimuth, altitude: altitude)
+        closeProximity(x: nx, y: ny)
+    }
+
+    private func emitPencil(_ phase: String, x: Double, y: Double,
+                            pressure: Double, azimuth: Double, altitude: Double) {
+        onPencil?(phase, x, y, pressure, azimuth, altitude)
     }
 }
