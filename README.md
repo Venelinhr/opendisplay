@@ -228,6 +228,29 @@ The capture/streaming pipeline itself uses only public APIs.
 | Touch input | ✅ | ✅ | ✅ | ✅ |
 | Self-hosted / auditable | ✅ | — | ❌ | ❌ |
 
+## Compatible apps
+
+The official apps cover a Mac sender and an iPhone/iPad receiver on iOS 17+.
+Other people have built their own clients that speak the same protocol, so
+you can also use an Android device or an older iPad as a display, or drive
+one from Linux. If your hardware is not covered yet, start here:
+
+**Android receivers**
+* [gprot42/android-opendisplay](https://github.com/gprot42/android-opendisplay) - GrapheneOS receiver for de-Googled Pixel phones and tablets, Android 8.0+
+* [josepacelli/opendisplay-android](https://github.com/josepacelli/opendisplay-android) - Android receiver, Android 8.0+, works with an unmodified Mac app
+
+**Older iOS receivers**
+* [cuongpham1/ipad-iphone-second-monitor-ios12-free](https://github.com/cuongpham1/ipad-iphone-second-monitor-ios12-free) - iOS 12 client for iPads and iPhones that cannot run the official app
+
+**Linux senders**
+* [tixwho/opendisplay-linux](https://github.com/tixwho/opendisplay-linux) - drive an iPhone or iPad from a Wayland desktop (KDE Plasma, Hyprland)
+
+These are fan-made projects, not official builds. They are not affiliated
+with OpenDisplay and are not maintained, reviewed, or supported by us, so
+please report issues with them in their own repositories. Listing them here
+also says nothing about our own plans: an official OpenDisplay app may still
+ship for any of these platforms later.
+
 ## Roadmap
 
 Tracked as [roadmap issues](https://github.com/peetzweg/opendisplay/issues?q=is%3Aissue+is%3Aopen+label%3Aroadmap) — pick one up if you'd like to contribute!
