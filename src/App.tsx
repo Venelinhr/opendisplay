@@ -136,6 +136,7 @@ export default function App() {
             <a href="#features">Features</a>
             <a href="#why">Compare</a>
             <a href="#faq">FAQ</a>
+            <a href="#compatible">Other platforms</a>
             <a href="#contribute">Contribute</a>
             <a
               className="gh"
