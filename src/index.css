@@ -37,6 +37,9 @@ nav .links a:hover { color: var(--fg); }
 nav .links a.gh { display: inline-flex; align-items: center; gap: 6px; }
 nav .gh-logo { width: 16px; height: 16px; fill: currentColor; display: block; }
 nav .gh-stars { font-variant-numeric: tabular-nums; }
+/* Seven links plus the star count outgrow the row well before the 680px
+   cutoff — tighten the spacing instead of dropping an item. */
+@media (max-width: 900px) { nav .links { gap: 14px; font-size: 0.85rem; } }
 @media (max-width: 680px) { nav .links { display: none; } }
 
 /* ---- section scaffolding ---- */
