@@ -471,7 +471,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         config.queueDepth = 8
         config.showsCursor = !localCursor
 
-        setupEncoder(width: pixelsWide, height: pixelsHigh)
+        try setupEncoder(width: pixelsWide, height: pixelsHigh)
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
@@ -1092,15 +1092,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: - Encoder setup
 
-    private func setupEncoder(width: Int, height: Int) {
-        // Low-latency rate control: the hardware encoder emits every frame
-        // immediately instead of pipelining. (`-lowlatency NO` for A/B.)
-        let lowLatency = UserDefaults.standard.object(forKey: "lowlatency") == nil
-            || UserDefaults.standard.bool(forKey: "lowlatency")
+    /// Create the compression session into `encoder`, optionally requiring an
+    /// encoder that supports low-latency rate control.
+    private func createCompressionSession(width: Int, height: Int, lowLatency: Bool) -> OSStatus {
         let spec: CFDictionary? = lowLatency
             ? [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue] as CFDictionary
             : nil
-        VTCompressionSessionCreate(
+        return VTCompressionSessionCreate(
             allocator: nil,
             width: Int32(width), height: Int32(height),
             codecType: kCMVideoCodecType_H264,
@@ -1111,9 +1109,40 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             refcon: nil,
             compressionSessionOut: &encoder
         )
+    }
+
+    private func setupEncoder(width: Int, height: Int) throws {
+        // Low-latency rate control: the hardware encoder emits every frame
+        // immediately instead of pipelining. (`-lowlatency NO` for A/B.)
+        let lowLatency = UserDefaults.standard.object(forKey: "lowlatency") == nil
+            || UserDefaults.standard.bool(forKey: "lowlatency")
+        // The spec filters which encoder VideoToolbox is allowed to pick, so an
+        // unsupported key fails creation outright rather than being ignored the
+        // way the properties below are: this key *requires* an encoder that
+        // offers the mode, and Macs whose only encoder is AMD have none (#133).
+        // Retrying without it is close to free — the guarantees the mode makes
+        // (infinite GOP, no reordering, High profile) are all set explicitly
+        // below, and the default rate controller only pipelines when it is fed
+        // faster than real time, which the pendingEncodes backpressure already
+        // prevents. Measured on Apple silicon at a paced 60fps: 5.3ms mean
+        // submit→emit without the spec vs 6.1ms with it, 1 frame held either
+        // way. (Overfeeding it at ~320fps does queue ~8 frames, hence the cap.)
+        var status = createCompressionSession(width: width, height: height, lowLatency: lowLatency)
+        var usedFallback = false
+        if encoder == nil, lowLatency {
+            Log.info("VTCompressionSessionCreate failed with low-latency rate control (status \(status)) — retrying without an encoder specification")
+            status = createCompressionSession(width: width, height: height, lowLatency: false)
+            usedFallback = true
+        }
         guard let encoder else {
-            Log.info("FATAL: VTCompressionSessionCreate failed")
-            return
+            // Returning here used to leave the session "connected, all green"
+            // with a dead encoder and a black receiver. Throw so the failure
+            // reaches the UI as a red "Failed:" status.
+            Log.info("FATAL: VTCompressionSessionCreate failed (status \(status))")
+            throw NSError(domain: "MacSender", code: 4, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "This Mac's video encoder could not be started (VideoToolbox error \(status))"
+            ])
         }
         // Low-latency settings: real-time, no B-frames, periodic keyframes.
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
@@ -1128,7 +1157,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
         VTCompressionSessionPrepareToEncodeFrames(encoder)
-        Log.info("encoder ready: \(width)x\(height) H.264 \(quality.bitrate / 1_000_000)Mbps quality=\(quality.rawValue) lowLatencyRC=\(lowLatency)")
+        Log.info("encoder ready: \(width)x\(height) H.264 \(quality.bitrate / 1_000_000)Mbps quality=\(quality.rawValue) lowLatencyRC=\(lowLatency && !usedFallback)\(usedFallback ? " (fallback)" : "")")
     }
 
     // MARK: - Capture callback
