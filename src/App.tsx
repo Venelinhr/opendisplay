@@ -136,6 +136,7 @@ export default function App() {
             <a href="#features">Features</a>
             <a href="#why">Compare</a>
             <a href="#faq">FAQ</a>
+            <a href="#compatible">Other platforms</a>
             <a href="#contribute">Contribute</a>
             <a
               className="gh"
@@ -443,6 +444,52 @@ export default function App() {
               to v0.4.x were MIT-licensed and remain available under those terms.)</p>
             </details>
           </div>
+        </div>
+      </section>
+
+      {/* Community clients for hardware the official apps don't cover. Keep in
+          sync with the "Compatible apps" section in the README. */}
+      <section id="compatible">
+        <div className="wrap sec">
+          <p className="eyebrow">Compatible apps</p>
+          <h2>Android, older iPads, Linux.</h2>
+          <p className="compat-lead">
+            The official apps are a Mac sender and an iPhone or iPad receiver. Other people have
+            built their own clients that speak the same protocol, so you can also use an Android
+            device or an older iPad as a display, or drive one from Linux. If your hardware isn't
+            covered yet, start here.
+          </p>
+          <div className="compat">
+            <a className="compat-item" href="https://github.com/gprot42/android-opendisplay">
+              <span className="compat-role">Android receiver</span>
+              <span className="compat-repo">gprot42/android-opendisplay ↗</span>
+              <p>GrapheneOS receiver for de-Googled Pixel phones and tablets. Android 8.0+.</p>
+            </a>
+            <a className="compat-item" href="https://github.com/josepacelli/opendisplay-android">
+              <span className="compat-role">Android receiver</span>
+              <span className="compat-repo">josepacelli/opendisplay-android ↗</span>
+              <p>Android receiver that works with an unmodified Mac app. Android 8.0+.</p>
+            </a>
+            <a
+              className="compat-item"
+              href="https://github.com/cuongpham1/ipad-iphone-second-monitor-ios12-free"
+            >
+              <span className="compat-role">iOS 12 receiver</span>
+              <span className="compat-repo">cuongpham1/ipad-iphone-second-monitor-ios12-free ↗</span>
+              <p>For iPads and iPhones too old to run the official receiver.</p>
+            </a>
+            <a className="compat-item" href="https://github.com/tixwho/opendisplay-linux">
+              <span className="compat-role">Linux sender</span>
+              <span className="compat-repo">tixwho/opendisplay-linux ↗</span>
+              <p>Drive an iPhone or iPad from a Wayland desktop (KDE Plasma, Hyprland).</p>
+            </a>
+          </div>
+          <p className="compat-note">
+            These are fan-made projects, not official builds. They aren't affiliated with
+            OpenDisplay and aren't maintained, reviewed or supported by us, so please report issues
+            with them in their own repositories. Listing them here also says nothing about our own
+            plans: an official OpenDisplay app may still ship for any of these platforms later.
+          </p>
         </div>
       </section>
 

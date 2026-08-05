@@ -118,7 +118,7 @@ The capture/streaming pipeline itself uses only public APIs.
 
 ## Compatible apps
 
-The official apps cover a Mac sender and an iPhone/iPad receiver on iOS 17+.
+The official apps cover a Mac sender and an iPhone/iPad receiver on iOS 16.4+.
 Other people have built their own clients that speak the same protocol, so
 you can also use an Android device or an older iPad as a display, or drive
 one from Linux. If your hardware is not covered yet, start here:

@@ -37,6 +37,9 @@ nav .links a:hover { color: var(--fg); }
 nav .links a.gh { display: inline-flex; align-items: center; gap: 6px; }
 nav .gh-logo { width: 16px; height: 16px; fill: currentColor; display: block; }
 nav .gh-stars { font-variant-numeric: tabular-nums; }
+/* Seven links plus the star count outgrow the row well before the 680px
+   cutoff — tighten the spacing instead of dropping an item. */
+@media (max-width: 900px) { nav .links { gap: 14px; font-size: 0.85rem; } }
 @media (max-width: 680px) { nav .links { display: none; } }
 
 /* ---- section scaffolding ---- */
@@ -268,6 +271,29 @@ summary::after { content: "+"; font-family: var(--mono); color: var(--faint);
   font-weight: 400; font-size: 1.2rem; }
 details[open] summary::after { content: "–"; }
 details p { color: var(--muted); padding: 0 0 24px; max-width: 78ch; }
+
+/* ---- compatible apps ---- */
+/* Same hairline-cell grid as .fgrid, but every cell is a link to a community
+   repo: mono role label on top, repo path as the heading. */
+.compat-lead { color: var(--muted); max-width: 78ch; margin-top: 8px; }
+.compat { display: grid; grid-template-columns: repeat(2, 1fr);
+  border-top: 1px solid var(--line); border-left: 1px solid var(--line);
+  margin-top: 32px; }
+a.compat-item { display: block; padding: 24px; text-decoration: none; color: var(--fg);
+  border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+a.compat-item:hover { background: #fafafa; }
+.compat-role { font-family: var(--mono); font-size: 0.78rem; color: var(--faint);
+  display: block; margin-bottom: 12px; }
+/* Repo paths are long (one runs to 45 chars) — allow a mid-path break so a
+   narrow cell wraps instead of overflowing. */
+.compat-repo { display: block; font-weight: 600; font-size: 1.02rem;
+  letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.compat-item p { color: var(--muted); font-size: 0.92rem; margin-top: 6px; }
+.compat-note { color: var(--muted); font-size: 0.9rem; max-width: 78ch; margin-top: 28px; }
+@media (max-width: 560px) {
+  .compat { grid-template-columns: 1fr; }
+  a.compat-item { padding: 20px; }
+}
 
 /* ---- support / ko-fi ---- */
 .support { text-align: center; }
