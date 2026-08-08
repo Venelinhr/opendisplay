@@ -89,6 +89,18 @@ without it: check Privacy & Security → Local Network on the Mac **and** on
 the iPhone, make sure both are on the same WiFi network, and keep the
 iPhone app open in the foreground. USB mode is unaffected.
 
+**What USB cable or version do I need?** Your cable **must support data** — a
+charge-only USB cable will **not** work. Look for a cable described as a
+*data*, *sync*, or *charging and data-transfer* cable. A data-capable USB 2.0
+cable is enough; USB 3, Thunderbolt, and video Alt Mode are not required.
+OpenDisplay streams H.264 over a TCP connection through macOS's built-in
+`usbmuxd`, not as a USB video device. Its highest-quality preset uses 18 Mb/s,
+well below USB 2.0's 480 Mb/s high-speed link rate, so USB 2.0 has ample
+bandwidth for the stream. USB 1.x is not supported or tested. For best
+reliability, use a known-good data/sync cable, unlock the device, accept the
+**Trust This Computer** prompt if it appears, and avoid unreliable hubs or
+adapters.
+
 **Does it support iPad?** The receiver app is universal (iPhone + iPad);
 iPad is the same codebase. iPad-specific polish (Pencil, pressure) is on the
 roadmap.
