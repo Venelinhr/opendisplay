@@ -39,22 +39,23 @@ enum Log {
         queue.async { append(data) }
     }
 
-    /// Writes the shareable snapshot to a temp file and hands back its URL, or
-    /// nil if it could not be written.
+    /// Writes the shareable snapshot to a temp file and hands back its URL
+    /// plus the snapshot text, or nil if it could not be written. The text
+    /// rides along so the caller never re-reads the file it was just handed.
     ///
     /// Runs on `queue`, so anything logged a moment ago is already on disk when
     /// the file is read: the interesting line is usually the last one, and a
     /// snapshot that races the write that motivated it is worthless. The
     /// completion lands on the main queue for the caller's UI.
     static func snapshot(context: LogSnapshot.Context,
-                         completion: @escaping (URL?) -> Void) {
+                         completion: @escaping ((url: URL, text: String)?) -> Void) {
         queue.async {
             let log = (try? Data(contentsOf: fileURL)) ?? Data()
             let now = Date()
             let text = LogSnapshot.compose(context: context, generatedAt: now, log: log)
             let url = write(text, named: LogSnapshot.fileName(deviceName: context.deviceName,
                                                              date: now))
-            DispatchQueue.main.async { completion(url) }
+            DispatchQueue.main.async { completion(url.map { ($0, text) }) }
         }
     }
 

@@ -97,13 +97,13 @@ struct DiagnosticsLogView: View {
     private func displayText(from text: String) -> String {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         guard lines.count > Self.displayedLines else { return text }
-        return "(showing the last \(Self.displayedLines) entries, the shared file has all of them)\n\n"
+        return "(showing the last \(Self.displayedLines) lines, the shared file has all of them)\n\n"
             + lines.suffix(Self.displayedLines).joined(separator: "\n")
     }
 
     private func load() {
-        Log.snapshot(context: context) { url in
-            guard let url, let text = try? String(contentsOf: url, encoding: .utf8) else {
+        Log.snapshot(context: context) { result in
+            guard let (url, text) = result else {
                 snapshot = .failed
                 return
             }
