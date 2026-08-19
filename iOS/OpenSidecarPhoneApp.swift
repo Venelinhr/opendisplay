@@ -543,6 +543,18 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    NavigationLink {
+                        DiagnosticsLogView()
+                    } label: {
+                        Label("Connection log", systemImage: "doc.text.magnifyingglass")
+                    }
+                } header: {
+                    Text("Diagnostics")
+                } footer: {
+                    Text("What this \(deviceKind) saw while connecting: sessions, restarts, decoder trouble. No screen content and nothing leaves the \(deviceKind) unless you share it. Attach it to a GitHub issue if a connection won't come up.")
+                }
+
+                Section {
                     Label("USB: plug in the cable, run the Mac app — it connects automatically through the wire (lowest latency).",
                           systemImage: "cable.connector")
                     Label("WiFi: both devices on the same network, then pick this \(deviceKind) in the Mac app's Connection menu.",

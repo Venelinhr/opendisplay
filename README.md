@@ -263,6 +263,21 @@ All live under **Privacy & Security** in System Settings (Mac) / Settings
 without them. If the prompt never appeared, toggle the entry manually or
 force-quit and reopen the app.
 
+### Getting the logs for a bug report
+
+Both apps keep a local log of connection events. Nothing is uploaded anywhere;
+the logs only leave a device when you share them.
+
+- **Mac:** click **Logs** in the app panel. Finder opens with
+  `~/Library/Logs/OpenDisplay` selected.
+- **iPhone/iPad:** shake the device (or tap **Settings & Help** when idle), then
+  open **Connection log**. Share hands the file to Mail, Messages or Files; copy
+  puts the text on the clipboard for pasting straight into an issue.
+
+The phone log is the half usually missing from a WiFi report: whether the
+receiver ever announced itself, whether its listener restarted, whether the
+decoder was failing. Attach both if you can.
+
 ## Roadmap
 
 Tracked as [roadmap issues](https://github.com/peetzweg/opendisplay/issues?q=is%3Aissue+is%3Aopen+label%3Aroadmap) — pick one up if you'd like to contribute!
