@@ -27,7 +27,8 @@ final class VirtualDisplay {
     /// `onOriginChange` reports where the display sits afterwards, so the
     /// caller can persist user drags.
     init?(name: String, pointsWide: Int, pointsHigh: Int, sizeInMillimeters: CGSize,
-          serialNum: UInt32 = 0x0001, restoreOrigin: CGPoint? = nil,
+          serialNum: UInt32 = 0x0001, productID: UInt32 = 0x4F53,
+          restoreOrigin: CGPoint? = nil,
           onOriginChange: ((CGPoint, CGSize) -> Void)? = nil) {
         self.pointsWide = pointsWide
         self.pointsHigh = pointsHigh
@@ -45,8 +46,10 @@ final class VirtualDisplay {
         descriptor.maxPixelsWide = UInt32(maxPointsPerAxis * 2)
         descriptor.maxPixelsHigh = UInt32(maxPointsPerAxis * 2)
         descriptor.sizeInMillimeters = sizeInMillimeters
-        descriptor.productID = 0x4F53   // "OS"
-        descriptor.vendorID = 0x5043    // "PC"
+        descriptor.productID = productID   // base 0x4F53 "OS"; moves with the
+                                           // serial when an identity is
+                                           // abandoned (see MacSender)
+        descriptor.vendorID = 0x5043       // "PC"
         descriptor.serialNum = serialNum
         descriptor.terminationHandler = { _, _ in
             Log.info("virtual display terminated by the system")

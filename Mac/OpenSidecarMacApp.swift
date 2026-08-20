@@ -122,6 +122,10 @@ final class DeviceSession: ObservableObject, Identifiable {
     @Published var status = "Starting…"
     @Published var framesSent = 0
     @Published var mbps = 0.0
+    // The sender's start() threw: the pipeline is freed, only this row's
+    // error text remains. A failed session must never swallow a fresh
+    // connect for its device the way a live one does.
+    @Published var failed = false
     // Receiver's per-install identity (from hello) — the key for recognizing
     // the same physical device across USB and WiFi.
     var deviceID: String?
@@ -285,10 +289,12 @@ final class SenderController: ObservableObject {
     }
 
     /// The session (over either transport) already serving this USB device.
+    /// A failed session serves nothing — it must not block auto-connecting
+    /// the same physical device over the other transport.
     private func activeSession(coveringUSB device: UsbmuxDevice) -> DeviceSession? {
-        if let direct = session(for: "usb:\(device.udid)") { return direct }
+        if let direct = session(for: "usb:\(device.udid)"), !direct.failed { return direct }
         return sessions.first { s in
-            guard case .wifi(let result) = s.target else { return false }
+            guard !s.failed, case .wifi(let result) = s.target else { return false }
             if let id = installIDByUDID[device.udid],
                s.deviceID == id || txtID(of: result) == id { return true }
             return serviceName(of: result) != nil && device.name == serviceName(of: result)
@@ -296,12 +302,14 @@ final class SenderController: ObservableObject {
     }
 
     /// The session (over either transport) already serving this WiFi service.
+    /// Failed sessions are excluded for the same reason as above.
     private func activeSession(coveringWiFi result: NWBrowser.Result) -> DeviceSession? {
-        if let name = serviceName(of: result), let direct = session(for: "wifi:\(name)") {
+        if let name = serviceName(of: result), let direct = session(for: "wifi:\(name)"),
+           !direct.failed {
             return direct
         }
         return sessions.first { s in
-            guard case .usb(let udid) = s.target else { return false }
+            guard !s.failed, case .usb(let udid) = s.target else { return false }
             if let id = txtID(of: result), s.deviceID == id { return true }
             if let udid, let device = usbDevices.first(where: { $0.udid == udid }),
                sameDevice(result, device) { return true }
@@ -417,12 +425,15 @@ final class SenderController: ObservableObject {
     /// sessions, the transports steal the receiver's single connection from
     /// each other forever. Keep the cable, drop the WiFi twin.
     private func dedupeSessions() {
+        // Failed sessions hold no pipeline: a USB corpse must never win the
+        // "keep the cable" rule against a working WiFi session.
         let usbSessionIDs = Set(sessions.compactMap { s -> String? in
-            if case .usb = s.target { return s.deviceID }
+            if case .usb = s.target, !s.failed { return s.deviceID }
             return nil
         })
-        let cabledNames = Set(usbDevices.compactMap { device in
-            session(for: "usb:\(device.udid)") != nil ? device.name : nil
+        let cabledNames = Set(usbDevices.compactMap { device -> String? in
+            guard let s = session(for: "usb:\(device.udid)"), !s.failed else { return nil }
+            return device.name
         })
         for s in sessions {
             guard case .wifi(let result) = s.target else { continue }
@@ -463,10 +474,24 @@ final class SenderController: ObservableObject {
         return hash == 0 ? 1 : hash
     }
 
+    // A display identity macOS saved hostile state for (see
+    // MacSender.setupExtend) is abandoned permanently: the validated offset
+    // from the device's base identity is persisted per session id and every
+    // future session starts from it.
+    private static func identityOffsetKey(for id: String) -> String { "displaySerialBump.\(id)" }
+    private func identityOffset(for id: String) -> UInt32 {
+        UInt32(clamping: UserDefaults.standard.integer(forKey: Self.identityOffsetKey(for: id)))
+    }
+
     func connect(to target: ConnectionTarget, userInitiated: Bool = false,
                  awaitingWake: Bool = false) {
         let id = target.sessionID
-        guard session(for: id) == nil else { return }
+        if let existing = session(for: id) {
+            // A failed session holds no pipeline — replace the corpse
+            // instead of letting it swallow the fresh attempt.
+            guard existing.failed else { return }
+            end(existing)
+        }
 
         // Never create a second session for the same physical device — the
         // receiver holds one connection, so a twin would steal it. But an
@@ -513,13 +538,17 @@ final class SenderController: ObservableObject {
         let name = label(for: target)
         let sender = MacSender(transport: transport, name: name, mode: mode,
                                quality: quality, displaySerial: Self.displaySerial(for: id),
+                               identityOffset: identityOffset(for: id),
                                awaitingWake: awaitingWake)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
             session.wifiServiceName = serviceName(of: result)
         }
         sender.onStatus = { [weak session] text in
-            session?.status = text
+            // Retry loops re-announce the same status every second (e.g. the
+            // asleep wait) — only a change is worth the UI churn and the log line.
+            guard let session, session.status != text else { return }
+            session.status = text
             Log.info("status[\(id)]: \(text)")
         }
         sender.onHello = { [weak self, weak session] info in
@@ -558,6 +587,23 @@ final class SenderController: ObservableObject {
             self.end(session)
             self.connect(to: target, awaitingWake: true)
         }
+        sender.onCaptureStoppedByUser = { [weak self, weak session] in
+            // The user stopped the capture in the system UI — same intent as
+            // the in-app Disconnect, so it also opts the device out of
+            // auto-connect (or the next browse event would resurrect it).
+            guard let self, let session else { return }
+            Log.info("session \(session.id) capture stopped via the system UI — honoring as disconnect")
+            self.disconnect(session)
+        }
+        sender.onDisplayIdentityBumped = { [weak session] totalOffset in
+            // The sender reports the validated absolute offset — store it
+            // as-is. Adding would double-count when a rotation rebuild
+            // re-discovers the same poisoned identity within one session.
+            guard let session else { return }
+            UserDefaults.standard.set(Int(totalOffset), forKey: Self.identityOffsetKey(for: session.id))
+            Log.info("display identity for \(session.id) moved to offset \(totalOffset) — "
+                + "macOS saved hostile state for the old one")
+        }
         sender.onPeerClosed = { [weak self, weak session] in
             // The receiver app quit — a deliberate goodbye, so no reconnect
             // waits around. Reopening the app is a fresh start handled by
@@ -575,6 +621,11 @@ final class SenderController: ObservableObject {
             } catch {
                 Log.info("sender failed to start: \(error)")
                 session.status = "Failed: \(error.localizedDescription)"
+                // Free the half-built pipeline: a leaked virtual display
+                // would keep holding this device's serial, and a parked
+                // live-looking session would swallow every future connect.
+                session.failed = true
+                sender.stop()
             }
         }
     }
@@ -594,6 +645,15 @@ final class SenderController: ObservableObject {
 
     func disconnectAll() {
         sessions.forEach { disconnect($0) }
+    }
+
+    /// Restart a session that failed to start (its pipeline is already
+    /// freed): tear the corpse out and dial the same target fresh. The
+    /// socket-only Reconnect can't help there — nothing was ever built.
+    func retry(_ session: DeviceSession) {
+        let target = session.target
+        end(session)
+        connect(to: target, userInitiated: true)
     }
 
     private func end(_ session: DeviceSession) {
@@ -1016,12 +1076,18 @@ struct SessionRow: View {
                     .foregroundStyle(.secondary)
             }
             Button {
-                session.sender.forceReconnect()
+                if session.failed {
+                    controller.retry(session)
+                } else {
+                    session.sender.forceReconnect()
+                }
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
             .controlSize(.small)
-            .help("Drop the connection and pair with the device again")
+            .help(session.failed
+                ? "Start this connection over"
+                : "Drop the connection and pair with the device again")
             Button("Disconnect") { controller.disconnect(session) }
                 .controlSize(.small)
         }
