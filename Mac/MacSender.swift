@@ -106,6 +106,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Fired on every hello — carries the receiver's install id so the
     // controller can deduplicate USB/WiFi sessions to the same device.
     @MainActor var onHello: ((PhoneInfo) -> Void)?
+    // Fired when the user stopped the capture from the system UI (menu-bar
+    // recording indicator / "Stop Extending"). The controller disconnects
+    // the session — teardown plus auto-connect opt-out — so the app honors
+    // the stop instead of fighting it.
+    @MainActor var onCaptureStoppedByUser: (() -> Void)?
+    // Fired when the device's base display identity had to be abandoned
+    // (macOS saved hostile state for it — see setupExtend) and a bumped
+    // serial worked: carries the offset for the controller to persist.
+    @MainActor var onDisplayIdentityBumped: ((UInt32) -> Void)?
 
     private var stream: SCStream?
     private var encoder: VTCompressionSession?
@@ -187,6 +196,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // not "app closed" — surface that instead of the usual hints. Cleared by
     // the first successful connection.
     private var awaitingWake: Bool
+
+    // A capture that keeps dying is not coming back on its own (capture
+    // authorization revoked, or saved display state blocks the identity) —
+    // retrying forever spams WindowServer with create/destroy cycles and,
+    // after a user-initiated stop, amounts to defying the user. Counted per
+    // failed recovery round, reset by a capture that comes back up. On
+    // `queue`.
+    private var captureRecoveryFailures = 0
+    private let maxCaptureRecoveryFailures = 5
 
     // Consecutive actively-refused dials on a previously connected session.
     // Refusal is unambiguous: the device is reachable but nothing listens,
@@ -370,38 +388,71 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // just-quit instance's display lingers in WindowServer for a moment
         // after the process dies. Retry through that window instead of
         // parking the session on "Failed" until a manual reconnect.
+        //
+        // macOS also keys SAVED display state on this identity, and that
+        // state can be hostile: the system UI's "Stop Extending" records a
+        // config under which the identity never comes online again —
+        // creation "succeeds" but the display joins neither the active
+        // display list nor shareable content (#206, #221). Unlike the saved
+        // mirror-set (#100) and 1x-mode variants, no post-creation
+        // enforcement can undo that, so an identity that never surfaces is
+        // abandoned for a fresh serial. The controller persists the working
+        // offset, so the device skips its poisoned identities from then on.
         var vd: VirtualDisplay?
-        for attempt in 0..<8 {
-            if attempt > 0 { try await Task.sleep(for: .seconds(2)) }
-            // A Disconnect during the retry window tore the session down. Bail
-            // before creating/assigning the display: the serial the old display
-            // held is likely free now, so a late attempt would *succeed* and
-            // resurrect the very zombie this retry exists to avoid. (Mirrors the
-            // `if stopped` checks in the permission-poll loops above.)
-            if stopped { return }
-            vd = await MainActor.run {
-                let restoreOrigin = DisplayArrangement.origin(for: sizeInPoints, device: arrangementKey)
-                return VirtualDisplay(name: displayName,
-                                      pointsWide: pointsWide, pointsHigh: pointsHigh,
-                                      sizeInMillimeters: mm, serialNum: serial,
-                                      restoreOrigin: restoreOrigin,
-                                      onOriginChange: { origin, currentSize in
-                                          DisplayArrangement.save(origin: origin, size: currentSize,
-                                                                  device: arrangementKey)
-                                      })
+        var display: SCDisplay?
+        var identityError = NSError(domain: "MacSender", code: 2,
+                                    userInfo: [NSLocalizedDescriptionKey: "CGVirtualDisplay creation failed"])
+        identities: for offset in 0..<UInt32(3) {
+            // A lingering serial belongs to a just-quit twin of the BASE
+            // identity; fresh fallback serials get a shorter window.
+            var created: VirtualDisplay?
+            for attempt in 0..<(offset == 0 ? 8 : 3) {
+                if attempt > 0 { try await Task.sleep(for: .seconds(2)) }
+                // A Disconnect during the retry window tore the session down. Bail
+                // before creating/assigning the display: the serial the old display
+                // held is likely free now, so a late attempt would *succeed* and
+                // resurrect the very zombie this retry exists to avoid. (Mirrors the
+                // `if stopped` checks in the permission-poll loops above.)
+                if stopped { return }
+                created = await MainActor.run {
+                    let restoreOrigin = DisplayArrangement.origin(for: sizeInPoints, device: arrangementKey)
+                    return VirtualDisplay(name: displayName,
+                                          pointsWide: pointsWide, pointsHigh: pointsHigh,
+                                          sizeInMillimeters: mm, serialNum: serial &+ offset,
+                                          restoreOrigin: restoreOrigin,
+                                          onOriginChange: { origin, currentSize in
+                                              DisplayArrangement.save(origin: origin, size: currentSize,
+                                                                      device: arrangementKey)
+                                          })
+                }
+                if created != nil { break }
+                Log.info("virtual display creation failed (serial +\(offset), attempt \(attempt + 1)) — retrying")
+                await status("Preparing virtual display…")
             }
-            if vd != nil { break }
-            Log.info("virtual display creation failed (attempt \(attempt + 1)) — retrying")
-            await status("Preparing virtual display…")
+            guard let candidate = created else { continue }
+            virtualDisplay = candidate
+            do {
+                display = try await findSCDisplay(id: candidate.displayID)
+                vd = candidate
+                if offset > 0 {
+                    Log.info("display identity +\(offset) came online — the base serial is "
+                        + "poisoned by saved system state; persisting the offset")
+                    Task { @MainActor in self.onDisplayIdentityBumped?(offset) }
+                }
+                break identities
+            } catch {
+                virtualDisplay = nil   // release the dead display and its serial
+                // No shareable displays at all is a permission-side failure —
+                // a different identity cannot help there.
+                if (error as NSError).domain == "MacSender", (error as NSError).code == 4 { throw error }
+                identityError = error as NSError
+                if stopped { return }
+                Log.info("virtual display (serial +\(offset)) never came online — trying a fresh identity")
+                await status("Display blocked by saved macOS state — trying a fresh identity…")
+            }
         }
-        guard let vd else {
-            throw NSError(domain: "MacSender", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "CGVirtualDisplay creation failed"])
-        }
-        virtualDisplay = vd
+        guard let vd, let display else { throw identityError }
         inputInjector = InputInjector(displayID: vd.displayID)
-
-        let display = try await findSCDisplay(id: vd.displayID)
         // Quality scaling: capture/encode below native when requested — the
         // display itself stays native so window layout is unaffected.
         let captureW = (Int(Double(pointsWide * 2) * quality.scale)) & ~1
@@ -493,8 +544,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// The virtual display takes a moment to show up in shareable content.
     private func findSCDisplay(id: CGDirectDisplayID, expectedSize: CGSize? = nil) async throws -> SCDisplay {
+        var lastDisplayCount = 0
         for _ in 0..<20 {
             let content = try await SCShareableContent.current
+            lastDisplayCount = content.displays.count
             if let display = content.displays.first(where: {
                 $0.displayID == id
                     && (expectedSize == nil
@@ -504,6 +557,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 return display
             }
             try await Task.sleep(for: .milliseconds(250))
+        }
+        // An empty display list is a different disease from "ours is
+        // missing": capture authorization is broken app-wide, and callers
+        // must not burn fallback identities on it.
+        if lastDisplayCount == 0 {
+            throw NSError(domain: "MacSender", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "macOS lists no capturable displays — "
+                              + "re-grant Screen Recording in System Settings, then relaunch"])
         }
         throw NSError(domain: "MacSender", code: 3,
                       userInfo: [NSLocalizedDescriptionKey: "virtual display never appeared in SCShareableContent"])
@@ -656,6 +717,16 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // already live. It must not tear down that replacement (#203).
         guard stream === self.stream else { return }
         Log.info("stream stopped with error: \(error)")
+        // The user stopped this capture from the system UI (the menu bar's
+        // recording indicator / "Stop Extending"). That is a disconnect, not
+        // a fault: restarting capture would defy the user — and macOS
+        // answers such defiance by saving display state that keeps this
+        // identity from ever coming online again (#206). Hand it to the
+        // controller to honor exactly like the in-app Disconnect.
+        if let scError = error as? SCStreamError, scError.code == .userStopped {
+            Task { @MainActor in self.onCaptureStoppedByUser?() }
+            return
+        }
         Task { await status("Capture stopped: \(error.localizedDescription)") }
         // E.g. display sleep can tear the virtual display down underneath the
         // stream — rebuild instead of sitting dead until an app restart.
@@ -697,9 +768,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                         Log.info("re-attach failed (\(error)) — falling back to full rebuild")
                         await self.reconfigure(hello)
                     }
-                    self.queue.async {
-                        if self.stream == nil { self.scheduleCaptureRecovery() }
-                    }
+                    self.queue.async { self.recoveryRoundEnded() }
                 }
                 return
             }
@@ -707,11 +776,28 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             Log.info("capture died — rebuilding pipeline")
             Task {
                 await self.reconfigure(hello)
-                self.queue.async {
-                    if self.stream == nil { self.scheduleCaptureRecovery() }
-                }
+                self.queue.async { self.recoveryRoundEnded() }
             }
         }
+    }
+
+    /// On `queue`: after a recovery round, re-arm the loop while capture is
+    /// still down — up to the cap, then declare the session gone. A capture
+    /// dead this many rounds is not coming back by itself, and ending the
+    /// session (display torn down, reconnect is the user's call) beats
+    /// hammering WindowServer with create/destroy cycles forever.
+    private func recoveryRoundEnded() {
+        guard stream == nil else {
+            captureRecoveryFailures = 0
+            return
+        }
+        captureRecoveryFailures += 1
+        guard captureRecoveryFailures < maxCaptureRecoveryFailures else {
+            Task { await status("Capture could not be restarted") }
+            reportGone("capture recovery failed \(captureRecoveryFailures)x — ending session")
+            return
+        }
+        scheduleCaptureRecovery()
     }
 
     // MARK: - Connection (with retry)

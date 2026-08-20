@@ -122,6 +122,10 @@ final class DeviceSession: ObservableObject, Identifiable {
     @Published var status = "Starting…"
     @Published var framesSent = 0
     @Published var mbps = 0.0
+    // The sender's start() threw: the pipeline is freed, only this row's
+    // error text remains. A failed session must never swallow a fresh
+    // connect for its device the way a live one does.
+    @Published var failed = false
     // Receiver's per-install identity (from hello) — the key for recognizing
     // the same physical device across USB and WiFi.
     var deviceID: String?
@@ -463,10 +467,25 @@ final class SenderController: ObservableObject {
         return hash == 0 ? 1 : hash
     }
 
+    // A display identity macOS saved hostile state for (see
+    // MacSender.setupExtend) is abandoned permanently: the offset that came
+    // online instead is persisted per session id and folded into every
+    // future serial for that device.
+    private static func serialBumpKey(for id: String) -> String { "displaySerialBump.\(id)" }
+    private func effectiveSerial(for id: String) -> UInt32 {
+        Self.displaySerial(for: id)
+            &+ UInt32(clamping: UserDefaults.standard.integer(forKey: Self.serialBumpKey(for: id)))
+    }
+
     func connect(to target: ConnectionTarget, userInitiated: Bool = false,
                  awaitingWake: Bool = false) {
         let id = target.sessionID
-        guard session(for: id) == nil else { return }
+        if let existing = session(for: id) {
+            // A failed session holds no pipeline — replace the corpse
+            // instead of letting it swallow the fresh attempt.
+            guard existing.failed else { return }
+            end(existing)
+        }
 
         // Never create a second session for the same physical device — the
         // receiver holds one connection, so a twin would steal it. But an
@@ -512,14 +531,17 @@ final class SenderController: ObservableObject {
 
         let name = label(for: target)
         let sender = MacSender(transport: transport, name: name, mode: mode,
-                               quality: quality, displaySerial: Self.displaySerial(for: id),
+                               quality: quality, displaySerial: effectiveSerial(for: id),
                                awaitingWake: awaitingWake)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
             session.wifiServiceName = serviceName(of: result)
         }
         sender.onStatus = { [weak session] text in
-            session?.status = text
+            // Retry loops re-announce the same status every second (e.g. the
+            // asleep wait) — only a change is worth the UI churn and the log line.
+            guard let session, session.status != text else { return }
+            session.status = text
             Log.info("status[\(id)]: \(text)")
         }
         sender.onHello = { [weak self, weak session] info in
@@ -558,6 +580,22 @@ final class SenderController: ObservableObject {
             self.end(session)
             self.connect(to: target, awaitingWake: true)
         }
+        sender.onCaptureStoppedByUser = { [weak self, weak session] in
+            // The user stopped the capture in the system UI — same intent as
+            // the in-app Disconnect, so it also opts the device out of
+            // auto-connect (or the next browse event would resurrect it).
+            guard let self, let session else { return }
+            Log.info("session \(session.id) capture stopped via the system UI — honoring as disconnect")
+            self.disconnect(session)
+        }
+        sender.onDisplayIdentityBumped = { [weak session] offset in
+            guard let session else { return }
+            let key = Self.serialBumpKey(for: session.id)
+            let total = UserDefaults.standard.integer(forKey: key) + Int(offset)
+            UserDefaults.standard.set(total, forKey: key)
+            Log.info("display identity for \(session.id) moved to serial offset \(total) — "
+                + "macOS saved hostile state for the old one")
+        }
         sender.onPeerClosed = { [weak self, weak session] in
             // The receiver app quit — a deliberate goodbye, so no reconnect
             // waits around. Reopening the app is a fresh start handled by
@@ -575,6 +613,11 @@ final class SenderController: ObservableObject {
             } catch {
                 Log.info("sender failed to start: \(error)")
                 session.status = "Failed: \(error.localizedDescription)"
+                // Free the half-built pipeline: a leaked virtual display
+                // would keep holding this device's serial, and a parked
+                // live-looking session would swallow every future connect.
+                session.failed = true
+                sender.stop()
             }
         }
     }
@@ -594,6 +637,15 @@ final class SenderController: ObservableObject {
 
     func disconnectAll() {
         sessions.forEach { disconnect($0) }
+    }
+
+    /// Restart a session that failed to start (its pipeline is already
+    /// freed): tear the corpse out and dial the same target fresh. The
+    /// socket-only Reconnect can't help there — nothing was ever built.
+    func retry(_ session: DeviceSession) {
+        let target = session.target
+        end(session)
+        connect(to: target, userInitiated: true)
     }
 
     private func end(_ session: DeviceSession) {
@@ -1016,12 +1068,18 @@ struct SessionRow: View {
                     .foregroundStyle(.secondary)
             }
             Button {
-                session.sender.forceReconnect()
+                if session.failed {
+                    controller.retry(session)
+                } else {
+                    session.sender.forceReconnect()
+                }
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
             .controlSize(.small)
-            .help("Drop the connection and pair with the device again")
+            .help(session.failed
+                ? "Start this connection over"
+                : "Drop the connection and pair with the device again")
             Button("Disconnect") { controller.disconnect(session) }
                 .controlSize(.small)
         }
