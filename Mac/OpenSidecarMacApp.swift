@@ -289,10 +289,12 @@ final class SenderController: ObservableObject {
     }
 
     /// The session (over either transport) already serving this USB device.
+    /// A failed session serves nothing — it must not block auto-connecting
+    /// the same physical device over the other transport.
     private func activeSession(coveringUSB device: UsbmuxDevice) -> DeviceSession? {
-        if let direct = session(for: "usb:\(device.udid)") { return direct }
+        if let direct = session(for: "usb:\(device.udid)"), !direct.failed { return direct }
         return sessions.first { s in
-            guard case .wifi(let result) = s.target else { return false }
+            guard !s.failed, case .wifi(let result) = s.target else { return false }
             if let id = installIDByUDID[device.udid],
                s.deviceID == id || txtID(of: result) == id { return true }
             return serviceName(of: result) != nil && device.name == serviceName(of: result)
@@ -300,12 +302,14 @@ final class SenderController: ObservableObject {
     }
 
     /// The session (over either transport) already serving this WiFi service.
+    /// Failed sessions are excluded for the same reason as above.
     private func activeSession(coveringWiFi result: NWBrowser.Result) -> DeviceSession? {
-        if let name = serviceName(of: result), let direct = session(for: "wifi:\(name)") {
+        if let name = serviceName(of: result), let direct = session(for: "wifi:\(name)"),
+           !direct.failed {
             return direct
         }
         return sessions.first { s in
-            guard case .usb(let udid) = s.target else { return false }
+            guard !s.failed, case .usb(let udid) = s.target else { return false }
             if let id = txtID(of: result), s.deviceID == id { return true }
             if let udid, let device = usbDevices.first(where: { $0.udid == udid }),
                sameDevice(result, device) { return true }
@@ -421,12 +425,15 @@ final class SenderController: ObservableObject {
     /// sessions, the transports steal the receiver's single connection from
     /// each other forever. Keep the cable, drop the WiFi twin.
     private func dedupeSessions() {
+        // Failed sessions hold no pipeline: a USB corpse must never win the
+        // "keep the cable" rule against a working WiFi session.
         let usbSessionIDs = Set(sessions.compactMap { s -> String? in
-            if case .usb = s.target { return s.deviceID }
+            if case .usb = s.target, !s.failed { return s.deviceID }
             return nil
         })
-        let cabledNames = Set(usbDevices.compactMap { device in
-            session(for: "usb:\(device.udid)") != nil ? device.name : nil
+        let cabledNames = Set(usbDevices.compactMap { device -> String? in
+            guard let s = session(for: "usb:\(device.udid)"), !s.failed else { return nil }
+            return device.name
         })
         for s in sessions {
             guard case .wifi(let result) = s.target else { continue }
@@ -468,13 +475,12 @@ final class SenderController: ObservableObject {
     }
 
     // A display identity macOS saved hostile state for (see
-    // MacSender.setupExtend) is abandoned permanently: the offset that came
-    // online instead is persisted per session id and folded into every
-    // future serial for that device.
-    private static func serialBumpKey(for id: String) -> String { "displaySerialBump.\(id)" }
-    private func effectiveSerial(for id: String) -> UInt32 {
-        Self.displaySerial(for: id)
-            &+ UInt32(clamping: UserDefaults.standard.integer(forKey: Self.serialBumpKey(for: id)))
+    // MacSender.setupExtend) is abandoned permanently: the validated offset
+    // from the device's base identity is persisted per session id and every
+    // future session starts from it.
+    private static func identityOffsetKey(for id: String) -> String { "displaySerialBump.\(id)" }
+    private func identityOffset(for id: String) -> UInt32 {
+        UInt32(clamping: UserDefaults.standard.integer(forKey: Self.identityOffsetKey(for: id)))
     }
 
     func connect(to target: ConnectionTarget, userInitiated: Bool = false,
@@ -531,7 +537,8 @@ final class SenderController: ObservableObject {
 
         let name = label(for: target)
         let sender = MacSender(transport: transport, name: name, mode: mode,
-                               quality: quality, displaySerial: effectiveSerial(for: id),
+                               quality: quality, displaySerial: Self.displaySerial(for: id),
+                               identityOffset: identityOffset(for: id),
                                awaitingWake: awaitingWake)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
         if case .wifi(let result) = target {
@@ -588,12 +595,13 @@ final class SenderController: ObservableObject {
             Log.info("session \(session.id) capture stopped via the system UI — honoring as disconnect")
             self.disconnect(session)
         }
-        sender.onDisplayIdentityBumped = { [weak session] offset in
+        sender.onDisplayIdentityBumped = { [weak session] totalOffset in
+            // The sender reports the validated absolute offset — store it
+            // as-is. Adding would double-count when a rotation rebuild
+            // re-discovers the same poisoned identity within one session.
             guard let session else { return }
-            let key = Self.serialBumpKey(for: session.id)
-            let total = UserDefaults.standard.integer(forKey: key) + Int(offset)
-            UserDefaults.standard.set(total, forKey: key)
-            Log.info("display identity for \(session.id) moved to serial offset \(total) — "
+            UserDefaults.standard.set(Int(totalOffset), forKey: Self.identityOffsetKey(for: session.id))
+            Log.info("display identity for \(session.id) moved to offset \(totalOffset) — "
                 + "macOS saved hostile state for the old one")
         }
         sender.onPeerClosed = { [weak self, weak session] in
