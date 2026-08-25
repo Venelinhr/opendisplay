@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.18.0](https://github.com/peetzweg/opendisplay/compare/v1.17.0...v1.18.0) (2026-08-25)
+
+
+### Features
+
+* **web:** add coverage showcase ([#239](https://github.com/peetzweg/opendisplay/issues/239)) ([89d9902](https://github.com/peetzweg/opendisplay/commit/89d9902857e23c67c77b7e845ddbd7b8e99d4aea))
+
 ## [1.17.0](https://github.com/peetzweg/opendisplay/compare/v1.16.1...v1.17.0) (2026-08-20)
 
 
