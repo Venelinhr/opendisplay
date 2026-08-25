@@ -278,12 +278,12 @@ export default function App() {
         <div className="wrap sec">
           <p className="eyebrow">Demo</p>
           <h2>See it in action.</h2>
-          <Showcase />
           <p className="sub">
             Using OpenDisplay in the wild?{" "}
             <a href="https://x.com/peetzweg">Tag @peetzweg on X</a> and your setup might
             end up here.
           </p>
+          <Showcase />
         </div>
       </section>
       </div>
