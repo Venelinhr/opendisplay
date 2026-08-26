@@ -59,6 +59,9 @@ pipeline, USB transport, input injection) are already working.
 - ⚡ **Low-latency pipeline** — hardware H.264 encode (VideoToolbox,
   real-time mode, no B-frames), TCP_NODELAY, frame-drop backpressure with
   keyframe recovery, decode-and-render via `AVSampleBufferDisplayLayer`.
+- 💻 **A spare Mac as a display** — switch the Mac app to *Be a Display*
+  and any other Mac extends onto it over WiFi or a Thunderbolt/Ethernet
+  cable, at native Retina resolution.
 - 🔒 **Self-hosted & private** — your screen never touches anyone's server.
   Two small apps, one TCP connection, that's it.
 
@@ -104,6 +107,21 @@ adapters.
 **Does it support iPad?** The receiver app is universal (iPhone + iPad);
 iPad is the same codebase. iPad-specific polish (Pencil, pressure) is on the
 roadmap.
+
+**Can another Mac be the display?** Yes. Install the Mac app on both, and on
+the spare Mac switch the role at the top of the panel to **Be a Display**. It
+shows up on the sending Mac like a phone does and becomes a real extended
+Retina display. Over WiFi it works out of the box. For a cable, connect the two
+Macs with a **Thunderbolt or USB4 cable** (macOS creates a *Thunderbolt Bridge*
+network between them) or with an **Ethernet** cable or adapters; the sender
+prefers that wired path automatically and the device row says *Cable*. A plain
+USB-C data cable does **not** work between two Macs: USB is host-to-device, and
+both Macs are hosts. That is different from iPhone/iPad, where the device side
+is what makes USB work. Older Macs with a Mini DisplayPort-shaped Thunderbolt 1
+or 2 port work with a Thunderbolt 3 to 2 adapter and a Thunderbolt 2 cable; the
+12-inch MacBook (2015 to 2017) has no Thunderbolt and needs Ethernet or WiFi.
+Input from the receiving Mac's keyboard and mouse is a follow-up
+([#147](https://github.com/peetzweg/opendisplay/issues/147)).
 
 **Why H.264 and not HEVC/AV1?** Hardware H.264 encode/decode is universally
 fast and the latency is excellent. HEVC is a planned option for better
@@ -185,7 +203,8 @@ on the App Store and lives on GitHub instead.
 ## Install
 
 You need **two apps**: a Mac app (captures and sends) and an iOS app
-(receives and displays).
+(receives and displays). To use a **second Mac** as the display, install the
+Mac app on both and switch the spare one to *Be a Display*; no iOS app needed.
 
 ### Prebuilt downloads (Mac)
 
@@ -304,7 +323,6 @@ Tracked as [roadmap issues](https://github.com/peetzweg/opendisplay/issues?q=is%
 - [#9](https://github.com/peetzweg/opendisplay/issues/9) Resolution & quality settings
 - [#10](https://github.com/peetzweg/opendisplay/issues/10) HEVC encoding
 - [#12](https://github.com/peetzweg/opendisplay/issues/12) Audio forwarding
-- [#17](https://github.com/peetzweg/opendisplay/issues/17) macOS receiver — use another Mac as a display
 
 **Experience**
 - [#11](https://github.com/peetzweg/opendisplay/issues/11) Menu bar app mode with auto-connect
@@ -314,7 +332,7 @@ Tracked as [roadmap issues](https://github.com/peetzweg/opendisplay/issues?q=is%
 - [#14](https://github.com/peetzweg/opendisplay/issues/14) Remote access beyond the local network
 - [#15](https://github.com/peetzweg/opendisplay/issues/15) Additional client platforms
 
-Done: prebuilt releases, built-in USB connectivity (no helper tools), WiFi via Bonjour, portrait mode, touch + two-finger scroll, performance overlay, iPad support, multiple devices at once ([#8](https://github.com/peetzweg/opendisplay/issues/8) — every connected device becomes its own extended display).
+Done: prebuilt releases, built-in USB connectivity (no helper tools), WiFi via Bonjour, portrait mode, touch + two-finger scroll, performance overlay, iPad support, multiple devices at once ([#8](https://github.com/peetzweg/opendisplay/issues/8) — every connected device becomes its own extended display), a Mac as the display ([#17](https://github.com/peetzweg/opendisplay/issues/17), WiFi or Thunderbolt/Ethernet cable).
 
 ## Auto-update (macOS app)
 

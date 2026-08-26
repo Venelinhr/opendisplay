@@ -335,6 +335,7 @@ export default function App() {
             <div className="fcell"><span className="n">007</span><h3>Touch &amp; scroll</h3><p>Tap to click, drag to drag, two-finger pan to scroll. A tiny touchscreen for your Mac.</p></div>
             <div className="fcell"><span className="n">008</span><h3>Portrait mode</h3><p>Rotate the phone and the virtual display rebuilds as a vertical monitor — perfect for chat, logs, or docs.</p></div>
             <div className="fcell"><span className="n">009</span><h3>Private by design</h3><p>One direct TCP connection between your devices. No servers, no accounts, no telemetry. Read the code.</p></div>
+            <div className="fcell"><span className="n">010</span><h3>A spare Mac as a display</h3><p>Switch the Mac app to <em>Be a Display</em> and another Mac extends onto it — a real Retina extended display, over WiFi or a Thunderbolt or Ethernet cable. An old MacBook becomes a second monitor.</p></div>
           </div>
         </div>
       </section>
@@ -426,6 +427,17 @@ export default function App() {
               <p>The receiver is a universal iOS app — it runs on iPad today. Run the Mac, an iPhone
               <em>and</em> an iPad at once for a second and a third screen. iPad-specific features
               (Apple Pencil, pressure) are on the roadmap.</p>
+            </details>
+            <details>
+              <summary>Can another Mac be the display?</summary>
+              <p>Yes. Install the Mac app on both Macs and switch the spare one to <em>Be a Display</em>
+              at the top of its panel; it appears on the sending Mac like a phone would and becomes a
+              real extended Retina display. WiFi works out of the box. For a cable, use a
+              <em>Thunderbolt or USB4</em> cable (macOS sets up a Thunderbolt Bridge network between
+              the two) or Ethernet — the sender picks the wired path automatically. A plain USB-C cable
+              does not work between two Macs: USB is host-to-device and both Macs are hosts, which is
+              exactly what makes it work with an iPhone or iPad but not Mac-to-Mac. Keyboard and mouse
+              input from the receiving Mac is a follow-up.</p>
             </details>
             <details>
               <summary>Is any of my screen data sent to a server?</summary>
