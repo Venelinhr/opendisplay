@@ -79,6 +79,17 @@ final class StreamReceiver: ObservableObject {
     private var listener: NWListener?
     private var listenerHealthy = false
     private var connection: NWConnection?
+    // Cursor side channel: UDP on port+1. Cursor positions ride TCP behind
+    // multi-hundred-KB video frames, so over WiFi one late frame stalls the
+    // cursor with it (head-of-line blocking). UDP datagrams skip that queue.
+    // Optional end to end: advertised in hello only once the listener is
+    // ready, and the sender keeps using TCP when it is absent.
+    private var cursorListener: NWListener?
+    private var cursorListenerReady = false
+    private var cursorConnection: NWConnection?
+    private var cursorPortAnnounced = false
+    private var lastCursorSeq: UInt64 = 0
+    private var cursorPort: UInt16 { port &+ 1 }
     private let queue = DispatchQueue(label: "receiver.video")
     private var buffer = Data()
     private var formatDesc: CMVideoFormatDescription?
@@ -351,6 +362,7 @@ final class StreamReceiver: ObservableObject {
                 self.listener?.cancel()
                 self.listener = nil
                 self.listenerHealthy = false
+                self.stopCursorListener()
                 self.setConnected(false)
                 self.setStatus(status)
                 completion?()
@@ -375,6 +387,98 @@ final class StreamReceiver: ObservableObject {
         listener = nil
         listenerHealthy = false
         startListener()
+    }
+
+    /// The UDP cursor listener follows the TCP listener's lifecycle: created
+    /// right after it, torn down with it. Losing it is never fatal; the
+    /// sender falls back to TCP when hello carries no cursorPort.
+    private func startCursorListener() {
+        stopCursorListener()
+        let params = NWParameters.udp
+        params.allowLocalEndpointReuse = true
+        params.includePeerToPeer = true
+        params.serviceClass = .responsiveData
+        let udp: NWListener
+        do {
+            udp = try NWListener(using: params, on: NWEndpoint.Port(rawValue: cursorPort)!)
+        } catch {
+            Log.info("cursor listener failed on udp :\(cursorPort): \(error) (cursor stays on TCP)")
+            return
+        }
+        cursorListener = udp
+        udp.newConnectionHandler = { [weak self] conn in
+            guard let self, self.cursorListener === udp else { conn.cancel(); return }
+            // A UDP "connection" is one remote host:port flow. The newest
+            // one is the live sender (a rebuilt sender socket gets a fresh
+            // ephemeral port) and starts its sequence over.
+            self.cursorConnection?.cancel()
+            self.cursorConnection = conn
+            self.lastCursorSeq = 0
+            conn.stateUpdateHandler = { [weak self] state in
+                guard let self, self.cursorConnection === conn else { return }
+                if case .failed(let error) = state {
+                    Log.info("cursor channel failed: \(error)")
+                    self.cursorConnection = nil
+                }
+            }
+            conn.start(queue: self.queue)
+            self.receiveCursorDatagrams(on: conn)
+        }
+        udp.stateUpdateHandler = { [weak self] state in
+            guard let self, self.cursorListener === udp else { return }
+            switch state {
+            case .ready:
+                self.cursorListenerReady = true
+                Log.info("cursor listener ready on udp :\(self.cursorPort)")
+                // hello may already be out without the port (the sender
+                // connected before UDP bound); re-send so it can switch.
+                if let connection, connection.state == .ready, !self.cursorPortAnnounced {
+                    self.sendHello(on: connection)
+                }
+            case .failed(let error):
+                Log.info("cursor listener failed: \(error) (cursor stays on TCP)")
+                self.stopCursorListener()
+            case .cancelled:
+                self.cursorListenerReady = false
+            default: break
+            }
+        }
+        udp.start(queue: queue)
+    }
+
+    private func stopCursorListener() {
+        cursorConnection?.cancel()
+        cursorConnection = nil
+        cursorListener?.cancel()
+        cursorListener = nil
+        cursorListenerReady = false
+        cursorPortAnnounced = false
+    }
+
+    private func receiveCursorDatagrams(on conn: NWConnection) {
+        conn.receiveMessage { [weak self] data, _, _, error in
+            guard let self, self.cursorConnection === conn else { return }
+            if let error {
+                Log.info("cursor channel receive error: \(error)")
+                return
+            }
+            if let data, !data.isEmpty { self.handleCursorDatagram(data) }
+            self.receiveCursorDatagrams(on: conn)
+        }
+    }
+
+    /// One datagram = one cursor JSON plus `s`, a per-flow sequence. UDP can
+    /// reorder, and a stale position after a fresh one reads as jitter, so
+    /// anything at or below the last seen sequence is dropped.
+    private func handleCursorDatagram(_ data: Data) {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              obj["type"] as? String == "cursor",
+              let seq = (obj["s"] as? NSNumber)?.uint64Value else { return }
+        guard seq > lastCursorSeq else { return }
+        // One line per flow so a field log shows the side channel is live.
+        if lastCursorSeq == 0 { Log.info("cursor channel: receiving datagrams") }
+        lastCursorSeq = seq
+        applyCursor(obj)
     }
 
     private func startListener() {
@@ -407,6 +511,8 @@ final class StreamReceiver: ObservableObject {
             self.connection?.cancel()
             self.connection = conn
             self.resetStreamState()
+            self.lastCursorSeq = 0   // the sender restarts its cursor sequence per session
+            self.cursorPortAnnounced = false
             conn.stateUpdateHandler = { [weak self] state in
                 switch state {
                 case .ready:
@@ -438,6 +544,7 @@ final class StreamReceiver: ObservableObject {
             }
         }
         listener?.start(queue: queue)
+        startCursorListener()
     }
 
     // MARK: - Liveness (ping + watchdog)
@@ -502,13 +609,7 @@ final class StreamReceiver: ObservableObject {
             macInputP95 = obj["inp95"] as? Double ?? macInputP95
             macCapFps = obj["capFps"] as? Int ?? macCapFps
         case "cursor":
-            let visible = (obj["v"] as? Int ?? 0) == 1
-            let x = obj["x"] as? Double ?? 0
-            let y = obj["y"] as? Double ?? 0
-            DispatchQueue.main.async {
-                self.cursorState = (x, y, visible)
-                self.onCursor?(x, y, visible)
-            }
+            applyCursor(obj)
         case "cursorImg":
             guard let b64 = obj["png"] as? String,
                   let png = Data(base64Encoded: b64),
@@ -544,6 +645,18 @@ final class StreamReceiver: ObservableObject {
         }
     }
 
+    /// Shared by the TCP control path and the UDP side channel so both feed
+    /// the same cursorState buffering and onCursor callback.
+    private func applyCursor(_ obj: [String: Any]) {
+        let visible = (obj["v"] as? Int ?? 0) == 1
+        let x = obj["x"] as? Double ?? 0
+        let y = obj["y"] as? Double ?? 0
+        DispatchQueue.main.async {
+            self.cursorState = (x, y, visible)
+            self.onCursor?(x, y, visible)
+        }
+    }
+
     private func resetStreamState() {
         buffer.removeAll(keepingCapacity: true)
         formatDesc = nil
@@ -564,7 +677,7 @@ final class StreamReceiver: ObservableObject {
     // MARK: - Control messages (phone -> Mac)
 
     private func sendHello(on conn: NWConnection) {
-        sendControl([
+        var hello: [String: Any] = [
             "type": "hello",
             "pixelsWide": devicePixelsWide,
             "pixelsHigh": devicePixelsHigh,
@@ -572,8 +685,13 @@ final class StreamReceiver: ObservableObject {
             "device": deviceKind,
             "id": Self.installID,
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
-        ], on: conn)
-        Log.info("hello sent")
+        ]
+        // Additive capability: only offered while the UDP listener is bound,
+        // so a sender never dials a port nobody answers on.
+        if cursorListenerReady { hello["cursorPort"] = Int(cursorPort) }
+        cursorPortAnnounced = cursorListenerReady
+        sendControl(hello, on: conn)
+        Log.info("hello sent\(cursorListenerReady ? " (cursorPort \(cursorPort))" : "")")
     }
 
     /// Touch events: x/y normalized [0,1] in video space, origin top-left.

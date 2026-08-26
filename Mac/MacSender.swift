@@ -73,6 +73,8 @@ struct PhoneInfo: Decodable {
                           // across USB and WiFi
     let pv: Int?          // receiver protocol version (issue #132); absent on
                           // every pre-handshake install → treat as protocol 1
+    let cursorPort: Int?  // UDP port for the cursor side channel (PROTOCOL.md
+                          // 6.3); absent = cursor stays on TCP
 
     var kind: String { device ?? "device" }
     var protocolVersion: Int { pv ?? WireProtocol.assumedWhenAbsent }
@@ -240,6 +242,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var cursorImageTimer: DispatchSourceTimer?
     private var lastCursorSent: (x: Double, y: Double, visible: Bool) = (-1, -1, false)
     private var lastCursorPNGHash = 0
+    // Cursor side channel (UDP, WiFi only): positions queue behind video
+    // frames on the shared TCP socket and stutter under head-of-line
+    // blocking. Opened when hello advertises cursorPort; while ready,
+    // pollCursorPosition sends there instead. Sprites stay on TCP (up to
+    // 24 KB, must arrive intact). All state lives on `queue`.
+    private var cursorConnection: NWConnection?
+    private var cursorChannelPort: NWEndpoint.Port?
+    private var cursorConnectionReady = false
+    private var cursorSeq: UInt64 = 0
     private var captureDisplayID: CGDirectDisplayID = 0
     // ScreenCaptureKit and VideoToolbox finish work asynchronously. During a
     // rotation, an old capture callback or a late encoder completion must not
@@ -666,6 +677,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         stream = nil
         connection?.cancel()
         connection = nil
+        closeCursorChannel()
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
         virtualDisplay = nil   // releasing it removes the display
@@ -698,6 +710,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.dialGeneration += 1   // a dial still in flight must not adopt
             self.connection?.cancel()
             self.connection = nil
+            self.closeCursorChannel()
             self.pendingSends = 0
             self.pipelineLock.lock()
             self.pendingEncodes = 0
@@ -1054,6 +1067,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let generation = dialGeneration
         connection?.cancel()
         connection = nil
+        closeCursorChannel()   // rebuilt from the next hello
         pendingSends = 0
         pipelineLock.lock()
         pendingEncodes = 0
@@ -1171,12 +1185,84 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if !lastCursorSent.visible
                 || abs(x - lastCursorSent.x) > 0.0004 || abs(y - lastCursorSent.y) > 0.0004 {
                 lastCursorSent = (x, y, true)
-                sendJSONFrame(String(format: "{\"type\":\"cursor\",\"x\":%.4f,\"y\":%.4f,\"v\":1}", x, y))
+                sendCursor(String(format: "\"x\":%.4f,\"y\":%.4f,\"v\":1", x, y))
             }
         } else if lastCursorSent.visible {
             lastCursorSent.visible = false
-            sendJSONFrame("{\"type\":\"cursor\",\"v\":0}")
+            sendCursor("\"v\":0")
         }
+    }
+
+    /// Cursor position: UDP side channel while it is up, TCP otherwise. The
+    /// datagram carries a sequence so the receiver can drop reordered ones;
+    /// the TCP frame is byte-identical to the pre-side-channel wire. Never
+    /// blocks: a send on a dead UDP socket just fails in its completion.
+    private func sendCursor(_ fields: String) {
+        if let cursorConnection, cursorConnectionReady {
+            cursorSeq &+= 1
+            let datagram = Data("{\"type\":\"cursor\",\(fields),\"s\":\(cursorSeq)}".utf8)
+            cursorConnection.send(content: datagram, completion: .contentProcessed { _ in })
+        } else {
+            sendJSONFrame("{\"type\":\"cursor\",\(fields)}")
+        }
+    }
+
+    /// Dial the receiver's UDP cursor port (must be called on `queue`). WiFi
+    /// only: usbmuxd tunnels TCP streams, there is no UDP through it. The
+    /// host is the one the live TCP connection actually reached, so a
+    /// Bonjour or Thunderbolt-bridged dial lands on the same interface. Any
+    /// failure here is silent: the cursor keeps riding TCP.
+    private func openCursorChannel(port: Int) {
+        guard case .tcp = transport, let conn = connection, connectionReady,
+              port > 0, port <= Int(UInt16.max),
+              let udpPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
+            closeCursorChannel()
+            return
+        }
+        if let existing = cursorConnection, cursorChannelPort == udpPort {
+            switch existing.state {
+            case .failed, .cancelled: break   // dead flow, dial again below
+            default: return   // rotation re-hello: keep the flow and its sequence
+            }
+        }
+        guard case .hostPort(let host, _)? = conn.currentPath?.remoteEndpoint else {
+            Log.info("cursor channel: no remote host for \(endpointName), cursor stays on TCP")
+            closeCursorChannel()
+            return
+        }
+        closeCursorChannel()
+        let params = NWParameters.udp
+        params.serviceClass = .responsiveData
+        let udp = NWConnection(host: host, port: udpPort, using: params)
+        cursorConnection = udp
+        cursorChannelPort = udpPort
+        cursorSeq = 0
+        udp.stateUpdateHandler = { [weak self] state in
+            guard let self, self.cursorConnection === udp else { return }
+            switch state {
+            case .ready:
+                self.cursorConnectionReady = true
+                Log.info("cursor channel ready: udp \(host):\(udpPort)")
+            case .failed(let error):
+                Log.info("cursor channel failed: \(error), cursor stays on TCP")
+                self.closeCursorChannel()
+            case .waiting(let error):
+                Log.info("cursor channel waiting: \(error), cursor stays on TCP")
+                self.cursorConnectionReady = false
+            case .cancelled:
+                self.cursorConnectionReady = false
+            default:
+                break
+            }
+        }
+        udp.start(queue: queue)
+    }
+
+    private func closeCursorChannel() {
+        cursorConnectionReady = false
+        cursorConnection?.cancel()
+        cursorConnection = nil
+        cursorChannelPort = nil
     }
 
     private func pollCursorImage() {
@@ -1260,6 +1346,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let previous = lastHello
                 lastHello = info
                 Task { @MainActor in self.onHello?(info) }
+                if let port = info.cursorPort {
+                    openCursorChannel(port: port)
+                } else {
+                    closeCursorChannel()
+                }
                 // Version handshake (issue #132). Reply with our identity, and
                 // if the receiver is below the version we support, tell it to
                 // update. Both are additive: older receivers ignore unknown

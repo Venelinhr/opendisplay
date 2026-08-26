@@ -57,7 +57,9 @@ sender reaches it identically over WiFi (dial the discovered address) and
 over USB (dial a tunneled port), and one code path serves both transports.
 
 * The protocol runs over a **single TCP connection**. Video, control
-  messages, and telemetry all share it, in both directions.
+  messages, and telemetry all share it, in both directions. The one
+  optional exception is the UDP cursor side channel (section 6.3), which
+  carries nothing a receiver cannot also get over TCP.
 * There is no TLS and no authentication at `pv` 3. The protocol is designed
   for trusted local networks and direct cables. Implementations SHOULD
   disable Nagle's algorithm (TCP_NODELAY); input events are tiny packets and
@@ -272,6 +274,10 @@ nothing before it arrives.
   transports and renames.
 * `pv` (int, optional): the receiver's protocol version. **Absent means
   1** (every pre-handshake install).
+* `cursorPort` (int, optional): a UDP port on the receiver that accepts
+  cursor datagrams (section 6.3). Present only while that listener is
+  actually bound. Absent means the receiver takes cursor positions over
+  TCP only. Additive at `pv` 3, no bump.
 
 A receiver MUST re-send `hello` on the live connection whenever its
 announced dimensions change (rotation). The sender rebuilds the display in
@@ -364,6 +370,42 @@ a PNG (kept under 24000 bytes pre-encoding, see section 4); `nw`, `nh` are
 the sprite's width/height **normalized to the display size**, so the
 receiver can scale it without knowing the sender's HiDPI factor; `ax`, `ay`
 are the hotspot **normalized within the sprite** (0..1 of its own size).
+
+### 6.3 Cursor side channel (UDP)
+
+Cursor positions share the TCP connection with video frames of several
+hundred KB. Over WiFi one late frame holds every cursor update queued
+behind it (head-of-line blocking), and the cursor stutters while the video
+is fine. The side channel moves the position messages, and only those, onto
+UDP where a lost or late datagram costs nothing: the next one supersedes it.
+
+* **Capability-gated and optional.** A receiver that offers it binds a UDP
+  listener (the official receiver uses TCP port + 1, so 9001 by default)
+  and advertises the port as `hello.cursorPort`. A sender that sees no
+  `cursorPort`, or cannot reach it, MUST keep sending `cursor` over TCP.
+  Either side may lack the feature with no loss beyond cursor smoothness.
+* **Bindings.** WiFi/LAN only. usbmuxd (section 2.2) tunnels TCP streams
+  and cannot carry UDP; a sender on the USB binding MUST ignore
+  `cursorPort`. The sender dials the same host the TCP connection reached.
+* **Datagram format.** One datagram is one `cursor` message (section 6.2)
+  as UTF-8 JSON, without the 4-byte length prefix, plus `s` (unsigned
+  integer): a sequence number that starts at 1 and increments by one per
+  datagram sent, e.g. `{"type":"cursor","x":0.4210,"y":0.7735,"v":1,"s":88}`.
+  Nothing but `cursor` messages travel here; `cursorImg` stays on TCP
+  because a sprite must arrive intact.
+* **Sequence semantics.** The receiver keeps the highest `s` seen and MUST
+  drop any datagram whose `s` is not greater than it (UDP reorders). The
+  sequence is per sender socket: it restarts whenever the sender opens a
+  new UDP flow, and the sender does so whenever its TCP connection is
+  re-established. The receiver therefore resets its tracker on every new
+  TCP connection and on every new UDP flow, and accepts datagrams only
+  from the most recently seen flow.
+* **Mixing.** A sender MAY switch between UDP and TCP for `cursor` at any
+  time (for example while the UDP connection is still being set up). Both
+  deliver into the same cursor state on the receiver.
+* **Firewall note.** A receiver offering the channel now also listens on
+  UDP (port + 1 for the official receiver). The official Mac receiver
+  therefore needs UDP 9001 open in addition to TCP 9000.
 Sent when the sprite changes and re-sent after reconnects.
 
 **`welcome`**: the sender's `pv` and `min` (the oldest receiver `pv` it
@@ -520,6 +562,7 @@ Mechanics at a glance (the policy behind them lives in COMPATIBILITY.md):
 | 1 | Baseline: framing, demux heuristic, video format, `hello`, `ping`/`pong`, `touch`, `scroll`, `kf`, `stats`, `cursor`, `cursorImg`, Bonjour TXT `id` |
 | 2 | Version handshake: `pv` in `hello` and TXT, `welcome`, `updateRequired`, `sleeping`, `closing` |
 | 3 | `pencil`, `proximity`; below pv 3 the receiver degrades stylus to `touch` |
+| 3 (additive) | `hello.cursorPort` and the UDP cursor side channel (6.3); optional, no bump |
 | 4 (reserved) | Typed frame header replacing the section 4 demux heuristic (two-phase migration) |
 
 ---
@@ -574,3 +617,4 @@ This file is versioned by git; the authoritative change log is
 | Date | Change |
 |---|---|
 | 2026-08-19 | Initial specification, written against `pv` 3 |
+| 2026-08-26 | Additive: `hello.cursorPort` and the UDP cursor side channel (section 6.3) |
