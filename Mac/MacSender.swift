@@ -96,9 +96,28 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // recording indicator all torn down) instead of dialing forever or
     // silently coming back over a different transport.
     @MainActor var onDisconnected: (() -> Void)?
+    // Fired when the receiver announces its device locked. The controller
+    // ends this session — an invisible display strands the cursor — and
+    // starts a fresh one that waits for the wake.
+    @MainActor var onPeerSleeping: (() -> Void)?
+    // Fired when the receiver announces the app is quitting: deliberate,
+    // so the controller ends the session without arming a reconnect.
+    @MainActor var onPeerClosed: (() -> Void)?
     // Fired on every hello — carries the receiver's install id so the
     // controller can deduplicate USB/WiFi sessions to the same device.
     @MainActor var onHello: ((PhoneInfo) -> Void)?
+    // Fired when the user stopped the capture from the system UI (menu-bar
+    // recording indicator / "Stop Extending"). The controller disconnects
+    // the session — teardown plus auto-connect opt-out — so the app honors
+    // the stop instead of fighting it.
+    @MainActor var onCaptureStoppedByUser: (() -> Void)?
+    // Fired when the device's display identity had to be abandoned (macOS
+    // saved hostile state for it — see setupExtend) and a bumped identity
+    // came online instead: carries the validated TOTAL offset from the
+    // device's base identity, for the controller to store as-is. Absolute,
+    // not a delta — repeated bumps in one session must not accumulate into
+    // an offset nothing ever validated.
+    @MainActor var onDisplayIdentityBumped: ((UInt32) -> Void)?
 
     private var stream: SCStream?
     private var encoder: VTCompressionSession?
@@ -116,13 +135,47 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Stable per-device serial for the virtual display, so macOS can tell
     // multiple OpenDisplay monitors apart and persist their arrangement.
     private let displaySerial: UInt32
+    // How far this device's identity has already moved off its base serial
+    // and productID (identities macOS saved hostile state for are abandoned
+    // permanently — see setupExtend). Advanced in-session when a fallback
+    // identity is validated, so a rotation rebuild doesn't re-probe the
+    // poisoned one.
+    private var baseIdentityOffset: UInt32
 
-    // Backpressure: outstanding sends. If the socket can't keep up we drop
-    // frames instead of queueing latency, then force a keyframe to resync.
-    // Kept tight: at 60fps each queued send is ~17ms of added latency.
+    // ── Encoder parallelism limiter (maxPendingEncodes = 1) ─────────────────
+    //
+    // VTCompressionSessionEncodeFrame returns immediately; the hardware H.264
+    // encoder runs asynchronously. If ScreenCaptureKit delivers the next frame
+    // before the previous encode callback fires, VideoToolbox will run multiple
+    // encodes in parallel inside the same session.
+    //
+    // Capping pendingEncodes at 1 enforces “latest frame wins” on the encoder:
+    // skip captures while an encode is in flight (enc drops), then feed the next
+    // fresh buffer when the callback clears the slot. The H.264 reference chain
+    // stays valid (pre-encode skip → normal P-frame n→n+2); we do NOT force
+    // keyframes on enc drops.
+    private var pendingEncodes = 0
+    private let maxPendingEncodes = 1
+
+    // ── Outstanding send backpressure (maxPendingSends = 3) ──────────────────
+    //
+    // pendingSends counts video frames whose NWConnection.send completion has
+    // not fired yet — i.e. bytes still in flight / waiting on TCP ACKs. Allow a
+    // small pipeline (3) so the link is not idle between ACKs; unlike the encoder,
+    // a few outstanding sends helps throughput without piling up seconds of lag.
+    //
+    // When pendingSends hits the cap we skip the capture before encode (net
+    // drops). Same drop point as enc drops, but means “TCP send queue full”, not
+    // “encoder busy” — split counters (enc↓ vs net↓) so the HUD shows which
+    // bottleneck fired. Never encode-then-discard: dropping here avoids wasting
+    // VT work on frames that would only add latency.
     private var pendingSends = 0
     private let maxPendingSends = 3
-    private var dropsThisWindow = 0
+    private let pipelineLock = NSLock()
+    private var dropsEncThisWindow = 0
+    private var dropsNetThisWindow = 0
+    private var dropsEncTotal = 0
+    private var dropsNetTotal = 0
     private var needsKeyframe = true
     private var connectionReady = false
     private var stopped = false
@@ -146,7 +199,31 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Liveness: both sides ping every 2s; if nothing arrives for 5s the link
     // is half-open (e.g. usbmuxd accepted but the device is gone) — reconnect.
     private var lastReceived = Date()
-    private var dropsTotal = 0
+
+    // Session created after the receiver went to sleep: it refuses
+    // connections until its screen is back, so dial failures mean "asleep",
+    // not "app closed" — surface that instead of the usual hints. Cleared by
+    // the first successful connection.
+    private var awaitingWake: Bool
+
+    // A capture that keeps dying is not coming back on its own (capture
+    // authorization revoked, or saved display state blocks the identity) —
+    // retrying forever spams WindowServer with create/destroy cycles and,
+    // after a user-initiated stop, amounts to defying the user. Counted per
+    // failed recovery round, reset by a capture that comes back up. On
+    // `queue`.
+    private var captureRecoveryFailures = 0
+    private let maxCaptureRecoveryFailures = 5
+
+    // Consecutive actively-refused dials on a previously connected session.
+    // Refusal is unambiguous: the device is reachable but nothing listens,
+    // so the app was quit (a suspended app's kernel still accepts, and a
+    // network blip times out instead of refusing). Three in a row (~3s)
+    // ends the session early; the full 10s grace stays reserved for the
+    // ambiguous failure kinds.
+    private var consecutiveRefusals = 0
+    private let refusalsBeforeGivingUp = 3
+    private var dropsTotal: Int { dropsEncTotal + dropsNetTotal }
 
     // Local cursor echo: a cursor baked into the video carries the full
     // capture→encode→stream→display latency (~30ms perceived). Instead we
@@ -160,10 +237,37 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastCursorSent: (x: Double, y: Double, visible: Bool) = (-1, -1, false)
     private var lastCursorPNGHash = 0
     private var captureDisplayID: CGDirectDisplayID = 0
+    // ScreenCaptureKit and VideoToolbox finish work asynchronously. During a
+    // rotation, an old capture callback or a late encoder completion must not
+    // put a frame from the retired display onto this device's new socket.
+    // Bumped on `queue` but read from the SCK sample queue and the VideoToolbox
+    // callback queue, so it lives under `pipelineLock` like the other counters
+    // those callbacks touch — read it via `captureGenerationNow`.
+    private var captureGeneration: UInt64 = 0
+    private var captureGenerationNow: UInt64 {
+        pipelineLock.lock()
+        defer { pipelineLock.unlock() }
+        return captureGeneration
+    }
 
     // Input latency: touches arrive stamped in our clock (the phone applies
     // its sync offset); delta to now = network + deframe + dispatch.
     private var inputLatencies: [Double] = []
+    // These policies bound noisy paths while retaining an explicit record when
+    // details were suppressed. Unknown types and unparseable messages live on
+    // `queue` with the rest of the control-connection state; encoder failures
+    // are guarded by `pipelineLock` with the other pipeline counters.
+    private var unknownTypeLogPolicy = UnknownControlTypeLogPolicy()
+    // Encode failures repeat every frame once the session goes bad; throttle
+    // the log to one line a second and carry the count.
+    private var encodeFailureLogPolicy = ThrottledLogPolicy<OSStatus>()
+    // Same for the encoder output callback rejecting a frame; separate policy
+    // so "submit failed" and "output rejected" stay distinguishable.
+    private var encodeOutputFailureLogPolicy = ThrottledLogPolicy<OSStatus>()
+    // A framing desync feeds this garbage at the peer's message rate until the
+    // watchdog redials, so it needs the same treatment. Detail is the byte
+    // count of the last message that would not parse.
+    private var unparseableControlLogPolicy = ThrottledLogPolicy<Int>()
     // Capture cadence: SCK only emits on content change, so the phone can't
     // tell "Mac rendered 45fps" from "frames got lost" — count deliveries here.
     private var capFrames = 0
@@ -178,14 +282,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // keyframe on — so keep the last frame around and re-encode it.
     private var lastPixelBuffer: CVPixelBuffer?
     private var lastCaptureAt = Date.distantPast
+    /// Debounced replay after encoder/send backpressure drops a frame.
+    /// At most one timer is active; each new drop resets the 30ms deadline.
+    private var dropReplayTimer: DispatchSourceTimer?
 
     init(transport: SenderTransport, name: String, mode: CaptureMode,
-         quality: StreamQuality = .best, displaySerial: UInt32 = 0x0001) {
+         quality: StreamQuality = .best, displaySerial: UInt32 = 0x0001,
+         identityOffset: UInt32 = 0, awaitingWake: Bool = false) {
         self.transport = transport
         self.endpointName = name
         self.mode = mode
         self.quality = quality
         self.displaySerial = displaySerial
+        self.baseIdentityOffset = identityOffset
+        self.awaitingWake = awaitingWake
         super.init()
     }
 
@@ -226,7 +336,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             try await startCapture(display: display, pixelsWide: captureW, pixelsHigh: captureH)
 
         case .extend:
-            await status("Waiting for the device to connect…")
+            // awaitingWake is queue-confined — read it there before surfacing.
+            queue.async { [weak self] in
+                guard let self else { return }
+                let text = self.awaitingWake
+                    ? "\(self.endpointName) is asleep — reconnects when it wakes…"
+                    : "Waiting for the device to connect…"
+                Task { await self.status(text) }
+            }
             let info = try await waitForHello()
             try await setupExtend(info)
 
@@ -266,13 +383,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let displayName = endpointName.hasPrefix("iPhone / iPad")
             ? "OpenDisplay — \(info.kind)"
             : "OpenDisplay — \(endpointName)"
-        // Orientation-specific serial: macOS persists the chosen mode per
-        // serial, and a portrait mode restored onto a landscape display
-        // pillarboxes the desktop INTO the framebuffer (streamed as-is).
-        // Distinct serials per orientation keep the two configs apart.
-        let serial = info.pixelsWide >= info.pixelsHigh
-            ? displaySerial
-            : displaySerial ^ 0x8000_0000
+        // Keep one stable identity across rotations. Reconfiguration below
+        // applies a new mode to the existing virtual monitor, so macOS keeps
+        // its windows and arrangement attached to this physical device.
+        let serial = displaySerial
         // Arrangement memory (#116): keyed on the device's install id so the
         // display returns to its spot across transports and orientations —
         // the serial-keyed memory macOS keeps starts from scratch whenever
@@ -284,38 +398,93 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // just-quit instance's display lingers in WindowServer for a moment
         // after the process dies. Retry through that window instead of
         // parking the session on "Failed" until a manual reconnect.
+        //
+        // macOS also keys SAVED display state on this identity, and that
+        // state can be hostile: the system UI's "Stop Extending" records a
+        // config under which the identity never comes online again —
+        // creation "succeeds" but the display joins neither the active
+        // display list nor shareable content (#206, #221). Unlike the saved
+        // mirror-set (#100) and 1x-mode variants, no post-creation
+        // enforcement can undo that, so an identity that never surfaces is
+        // abandoned for a fresh serial. The controller persists the working
+        // offset, so the device skips its poisoned identities from then on.
         var vd: VirtualDisplay?
-        for attempt in 0..<8 {
-            if attempt > 0 { try await Task.sleep(for: .seconds(2)) }
-            // A Disconnect during the retry window tore the session down. Bail
-            // before creating/assigning the display: the serial the old display
-            // held is likely free now, so a late attempt would *succeed* and
-            // resurrect the very zombie this retry exists to avoid. (Mirrors the
-            // `if stopped` checks in the permission-poll loops above.)
-            if stopped { return }
-            vd = await MainActor.run {
-                VirtualDisplay(name: displayName,
-                               pointsWide: pointsWide, pointsHigh: pointsHigh,
-                               sizeInMillimeters: mm, serialNum: serial,
-                               restoreOrigin: DisplayArrangement.origin(for: sizeInPoints,
-                                                                        device: arrangementKey),
-                               onOriginChange: { origin in
-                                   DisplayArrangement.save(origin: origin, size: sizeInPoints,
-                                                           device: arrangementKey)
-                               })
+        var display: SCDisplay?
+        var identityError = NSError(domain: "MacSender", code: 2,
+                                    userInfo: [NSLocalizedDescriptionKey: "CGVirtualDisplay creation failed"])
+        // Only a created-but-never-surfaced display proves the identity is
+        // poisoned. Creation refusing outright usually means a twin still
+        // holds the serial (just-quit instance, parallel debug build) —
+        // moving to a fallback identity is fine for THIS session, but the
+        // move must not be persisted over a merely-transient condition.
+        var sawPoisonedIdentity = false
+        identities: for probe in 0..<UInt32(3) {
+            let totalOffset = baseIdentityOffset &+ probe
+            // A lingering serial belongs to a just-quit twin of the CURRENT
+            // identity; fresh fallback identities get a shorter window.
+            var created: VirtualDisplay?
+            for attempt in 0..<(probe == 0 ? 8 : 3) {
+                if attempt > 0 { try await Task.sleep(for: .seconds(2)) }
+                // A Disconnect during the retry window tore the session down. Bail
+                // before creating/assigning the display: the serial the old display
+                // held is likely free now, so a late attempt would *succeed* and
+                // resurrect the very zombie this retry exists to avoid. (Mirrors the
+                // `if stopped` checks in the permission-poll loops above.)
+                if stopped { return }
+                created = await MainActor.run {
+                    let restoreOrigin = DisplayArrangement.origin(for: sizeInPoints, device: arrangementKey)
+                    // The productID moves with the serial: field data in #206
+                    // suggests some macOS versions key the hostile state on
+                    // the product, not the serial — bumping both escapes
+                    // either keying.
+                    return VirtualDisplay(name: displayName,
+                                          pointsWide: pointsWide, pointsHigh: pointsHigh,
+                                          sizeInMillimeters: mm,
+                                          serialNum: serial &+ totalOffset,
+                                          productID: 0x4F53 &+ totalOffset,
+                                          restoreOrigin: restoreOrigin,
+                                          onOriginChange: { origin, currentSize in
+                                              DisplayArrangement.save(origin: origin, size: currentSize,
+                                                                      device: arrangementKey)
+                                          })
+                }
+                if created != nil { break }
+                Log.info("virtual display creation failed (identity +\(totalOffset), attempt \(attempt + 1)) — retrying")
+                await status("Preparing virtual display…")
             }
-            if vd != nil { break }
-            Log.info("virtual display creation failed (attempt \(attempt + 1)) — retrying")
-            await status("Preparing virtual display…")
+            guard let candidate = created else { continue }
+            virtualDisplay = candidate
+            do {
+                display = try await findSCDisplay(id: candidate.displayID)
+                vd = candidate
+                if probe > 0, sawPoisonedIdentity {
+                    Log.info("display identity +\(totalOffset) came online — the previous one is "
+                        + "poisoned by saved system state; persisting the offset")
+                    baseIdentityOffset = totalOffset   // rebuilds skip the dead probe
+                    Task { @MainActor in self.onDisplayIdentityBumped?(totalOffset) }
+                }
+                break identities
+            } catch {
+                virtualDisplay = nil   // release the dead display and its serial
+                // No shareable displays at all is a permission-side failure —
+                // a different identity cannot help there.
+                if (error as NSError).domain == "MacSender", (error as NSError).code == 4 { throw error }
+                identityError = error as NSError
+                sawPoisonedIdentity = true
+                if stopped { return }
+                Log.info("virtual display (identity +\(totalOffset)) never came online — trying a fresh identity")
+                await status("Display blocked by saved macOS state — trying a fresh identity…")
+            }
         }
-        guard let vd else {
-            throw NSError(domain: "MacSender", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "CGVirtualDisplay creation failed"])
+        guard let vd, let display else {
+            if sawPoisonedIdentity {
+                throw NSError(domain: "MacSender", code: 5, userInfo: [
+                    NSLocalizedDescriptionKey: "saved display state in macOS is blocking "
+                        + "OpenDisplay's displays — log out and back in (or restart the Mac), then reconnect"])
+            }
+            throw identityError
         }
-        virtualDisplay = vd
         inputInjector = InputInjector(displayID: vd.displayID)
-
-        let display = try await findSCDisplay(id: vd.displayID)
         // Quality scaling: capture/encode below native when requested — the
         // display itself stays native so window layout is unaffected.
         let captureW = (Int(Double(pointsWide * 2) * quality.scale)) & ~1
@@ -342,14 +511,25 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         var target = info
         while !stopped {
             Log.info("reconfiguring for \(target.pixelsWide)x\(target.pixelsHigh)")
+            // A cached frame is valid for a network reconnect to the same
+            // display, but never for a rotation: it belongs to the retired
+            // desktop and can otherwise be replayed onto the new one.
+            invalidateCapturePipeline(discardingLastFrame: true)
             if let stream { try? await stream.stopCapture() }
             stream = nil
             if let encoder { VTCompressionSessionInvalidate(encoder) }
             encoder = nil
-            virtualDisplay = nil   // removes the old display
             needsKeyframe = true
             do {
-                try await setupExtend(target)
+                if try await resizeExistingDisplay(for: target) {
+                    // The display identity survived, so WindowServer has no
+                    // reason to migrate this device's windows to a sibling.
+                } else {
+                    // Safety fallback for a system that refuses an in-place
+                    // mode switch. This keeps the old recovery behaviour.
+                    virtualDisplay = nil
+                    try await setupExtend(target)
+                }
             } catch {
                 Log.info("reconfigure failed: \(error)")
                 await status("Rotation failed: \(error.localizedDescription)")
@@ -364,14 +544,60 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// Apply the rotated mode to the existing virtual monitor and restart
+    /// only the capture/encoder pieces that depend on pixel dimensions.
+    /// Returns false when there is no reusable display or macOS rejected the
+    /// mode switch, letting the caller use the legacy rebuild fallback.
+    private func resizeExistingDisplay(for info: PhoneInfo) async throws -> Bool {
+        guard let vd = virtualDisplay else { return false }
+
+        let pointsWide = (info.pixelsWide / 2) & ~1
+        let pointsHigh = (info.pixelsHigh / 2) & ~1
+        let arrangementKey = info.id ?? String(format: "serial-%08x", displaySerial)
+        let size = CGSize(width: pointsWide, height: pointsHigh)
+        let didResize = await MainActor.run {
+            vd.resize(pointsWide: pointsWide, pointsHigh: pointsHigh,
+                      movingTo: DisplayArrangement.origin(for: size, device: arrangementKey))
+        }
+        guard didResize else { return false }
+
+        let display = try await findSCDisplay(id: vd.displayID, expectedSize: size)
+        let captureW = (Int(Double(pointsWide * 2) * quality.scale)) & ~1
+        let captureH = (Int(Double(pointsHigh * 2) * quality.scale)) & ~1
+        try await startCapture(display: display, pixelsWide: captureW, pixelsHigh: captureH)
+        inputInjector = InputInjector(displayID: vd.displayID)
+
+        if UserDefaults.standard.bool(forKey: "testPattern") {
+            let id = vd.displayID
+            Task { @MainActor in TestPattern.show(on: id) }
+        }
+        return true
+    }
+
     /// The virtual display takes a moment to show up in shareable content.
-    private func findSCDisplay(id: CGDirectDisplayID) async throws -> SCDisplay {
+    private func findSCDisplay(id: CGDirectDisplayID, expectedSize: CGSize? = nil) async throws -> SCDisplay {
+        var lastDisplayCount = 0
         for _ in 0..<20 {
             let content = try await SCShareableContent.current
-            if let display = content.displays.first(where: { $0.displayID == id }) {
+            lastDisplayCount = content.displays.count
+            if let display = content.displays.first(where: {
+                $0.displayID == id
+                    && (expectedSize == nil
+                        || ($0.width == Int(expectedSize!.width)
+                            && $0.height == Int(expectedSize!.height)))
+            }) {
                 return display
             }
             try await Task.sleep(for: .milliseconds(250))
+        }
+        // An empty display list is a different disease from "ours is
+        // missing": capture authorization is broken app-wide, and callers
+        // must not burn fallback identities on it.
+        if lastDisplayCount == 0 {
+            throw NSError(domain: "MacSender", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "macOS returned no capturable displays — "
+                              + "the screen may be locked; if this persists unlocked, re-grant "
+                              + "Screen Recording in System Settings and relaunch"])
         }
         throw NSError(domain: "MacSender", code: 3,
                       userInfo: [NSLocalizedDescriptionKey: "virtual display never appeared in SCShareableContent"])
@@ -397,23 +623,37 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         config.queueDepth = 8
         config.showsCursor = !localCursor
 
-        setupEncoder(width: pixelsWide, height: pixelsHigh)
+        invalidateCapturePipeline(discardingLastFrame: true)
+        let generation = captureGenerationNow
+        try setupEncoder(width: pixelsWide, height: pixelsHigh)
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
-        try await stream.startCapture()
         self.stream = stream
+        do {
+            try await stream.startCapture()
+        } catch {
+            if self.stream === stream { self.stream = nil }
+            throw error
+        }
         captureDisplayID = display.displayID
         lastCursorPNGHash = 0      // rotation rebuilds: re-send the sprite
         lastCursorSent = (-1, -1, false)
         startCursorEcho()
-        Log.info("capture started: \(pixelsWide)x\(pixelsHigh) display \(display.displayID) mode \(mode.rawValue) localCursor=\(localCursor)")
+        // A capture that came back through any path (recovery, rotation,
+        // identity fallback) earns the full recovery budget again — without
+        // this, a pending recovery timer that finds the stream alive exits
+        // without ever resetting the counter, and the next unrelated death
+        // starts with as little as one round left.
+        queue.async { self.captureRecoveryFailures = 0 }
+        Log.info("capture started: \(pixelsWide)x\(pixelsHigh) display \(display.displayID) generation \(generation) mode \(mode.rawValue) localCursor=\(localCursor)")
         let kind = lastHello?.kind ?? "device"
         await status("\(mode == .extend ? "Extending to" : "Mirroring to") \(kind) (\(pixelsWide)×\(pixelsHigh))")
     }
 
     func stop() {
         stopped = true
+        invalidateCapturePipeline(discardingLastFrame: true)
         cursorTimer?.cancel()
         cursorTimer = nil
         cursorImageTimer?.cancel()
@@ -425,6 +665,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         encoder = nil
         virtualDisplay = nil   // releasing it removes the display
+        cancelDropReplayTimer()
         queue.async { [weak self] in
             // Unblock a start() that is still waiting for the hello.
             self?.helloContinuation?.resume(throwing: CancellationError())
@@ -454,7 +695,48 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.connection?.cancel()
             self.connection = nil
             self.pendingSends = 0
+            self.pipelineLock.lock()
+            self.pendingEncodes = 0
+            self.pipelineLock.unlock()
             self.connect()
+        }
+    }
+
+    // The controller's end() is idempotent, but several detectors (grace,
+    // refusals, service withdrawal) can conclude "gone" repeatedly while the
+    // stop is in flight — report once so the log tells the story once.
+    private var goneReported = false
+
+    /// Declare the device gone and end the session (must be called on `queue`).
+    private func reportGone(_ reason: String) {
+        guard !goneReported, !stopped else { return }
+        goneReported = true
+        Log.info(reason)
+        Task { @MainActor in self.onDisconnected?() }
+    }
+
+    /// A dial was actively refused (must be called on `queue`). On a session
+    /// that has streamed before, enough refusals in a row prove the receiver
+    /// app is gone — end now instead of waiting out the grace.
+    private func dialRefused() {
+        guard everConnected, !stopped else { return }
+        consecutiveRefusals += 1
+        if consecutiveRefusals >= refusalsBeforeGivingUp {
+            reportGone("dial refused \(consecutiveRefusals)x — receiver app is gone, ending session")
+        }
+    }
+
+    /// The receiver's Bonjour advertisement disappeared (the system
+    /// deregisters a dead app's service within ~1s, while a suspended app
+    /// keeps it). Only meaningful once the connection is already down —
+    /// a live connection outranks a flapping mDNS cache. Together they
+    /// prove a WiFi receiver quit, where dials just stall instead of
+    /// being refused.
+    func peerServiceWithdrawn() {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, self.everConnected,
+                  !self.connectionReady else { return }
+            self.reportGone("service withdrawn and connection down — receiver app is gone, ending session")
         }
     }
 
@@ -470,28 +752,105 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        // A retired stream commonly reports its stop after the replacement is
+        // already live. It must not tear down that replacement (#203).
+        guard stream === self.stream else { return }
         Log.info("stream stopped with error: \(error)")
+        // The user stopped this capture from the system UI (the menu bar's
+        // recording indicator / "Stop Extending"). That is a disconnect, not
+        // a fault: restarting capture would defy the user — and macOS
+        // answers such defiance by saving display state that keeps this
+        // identity from ever coming online again (#206). Hand it to the
+        // controller to honor exactly like the in-app Disconnect.
+        if let scError = error as? SCStreamError, scError.code == .userStopped,
+           consoleIsInteractive {
+            Task { @MainActor in self.onCaptureStoppedByUser?() }
+            return
+        }
         Task { await status("Capture stopped: \(error.localizedDescription)") }
         // E.g. display sleep can tear the virtual display down underneath the
         // stream — rebuild instead of sitting dead until an app restart.
         guard !stopped, mode == .extend else { return }
+        invalidateCapturePipeline()
         self.stream = nil
         scheduleCaptureRecovery()
     }
 
-    /// Retry until capture is back (a rebuild during display sleep can fail).
+    /// Retry until capture is back. Per issue #29 fix-plan point 1: a dead
+    /// stream does NOT mean the display is gone. If our own virtual display
+    /// still exists, just re-attach the capture to it — rebuilding the display
+    /// (destroy+create) is what killed the NEIGHBOR's stream and ping-ponged
+    /// the infinite rebuild loop. Only do a full `reconfigure` when the display
+    /// is actually gone (e.g. display sleep tore it down).
     private func scheduleCaptureRecovery() {
         queue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self, !self.stopped, self.stream == nil,
                   let hello = self.lastHello else { return }
+            // Does our virtual display still exist? CGDisplayBounds returns a
+            // zero rect for an unknown id, so a non-empty bounds means it's live.
+            // Test isEmpty, not isNull: isNull is only true for the special
+            // CGRect.null, so it reads as "live" for a dead display too and the
+            // rebuild fallback below would become unreachable.
+            if let vd = self.virtualDisplay,
+               !CGDisplayBounds(vd.displayID).isEmpty {
+                Log.info("capture died — display still present, re-attaching capture only (#29)")
+                Task {
+                    do {
+                        let display = try await self.findSCDisplay(id: vd.displayID)
+                        // Capture at the display's pixel resolution (points ×2 @2x),
+                        // not SCDisplay.width (logical points) — matches setupExtend.
+                        let captureW = (Int(Double(vd.pointsWide * 2) * self.quality.scale)) & ~1
+                        let captureH = (Int(Double(vd.pointsHigh * 2) * self.quality.scale)) & ~1
+                        try await self.startCapture(display: display,
+                                                    pixelsWide: captureW, pixelsHigh: captureH)
+                        self.needsKeyframe = true
+                    } catch {
+                        Log.info("re-attach failed (\(error)) — falling back to full rebuild")
+                        await self.reconfigure(hello)
+                    }
+                    self.queue.async { self.recoveryRoundEnded() }
+                }
+                return
+            }
+            // Display genuinely gone — full rebuild (preserves old behavior).
             Log.info("capture died — rebuilding pipeline")
             Task {
                 await self.reconfigure(hello)
-                self.queue.async {
-                    if self.stream == nil { self.scheduleCaptureRecovery() }
-                }
+                self.queue.async { self.recoveryRoundEnded() }
             }
         }
+    }
+
+    /// SCK can report `.userStopped` for stops the user did not initiate
+    /// when the console goes non-interactive (screen lock, fast user
+    /// switch). Only a stop from an interactive console can be a deliberate
+    /// menu-bar "stop sharing"; everything else stays on the recovery path,
+    /// which was already how those transitions healed before this check
+    /// existed.
+    private var consoleIsInteractive: Bool {
+        guard let info = CGSessionCopyCurrentDictionary() as? [String: Any] else { return true }
+        let onConsole = info[kCGSessionOnConsoleKey as String] as? Bool ?? true
+        let locked = info["CGSSessionScreenIsLocked"] as? Bool ?? false
+        return onConsole && !locked
+    }
+
+    /// On `queue`: after a recovery round, re-arm the loop while capture is
+    /// still down — up to the cap, then declare the session gone. A capture
+    /// dead this many rounds is not coming back by itself, and ending the
+    /// session (display torn down, reconnect is the user's call) beats
+    /// hammering WindowServer with create/destroy cycles forever.
+    private func recoveryRoundEnded() {
+        guard stream == nil else {
+            captureRecoveryFailures = 0
+            return
+        }
+        captureRecoveryFailures += 1
+        guard captureRecoveryFailures < maxCaptureRecoveryFailures else {
+            Task { await status("Capture could not be restarted") }
+            reportGone("capture recovery failed \(captureRecoveryFailures)x — ending session")
+            return
+        }
+        scheduleCaptureRecovery()
     }
 
     // MARK: - Connection (with retry)
@@ -513,8 +872,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         Log.info("connection ready to \(endpointName)")
         connectionReady = true
         everConnected = true
+        awaitingWake = false
+        consecutiveRefusals = 0
         disconnectedSince = nil
         needsKeyframe = true   // new peer needs SPS/PPS + IDR
+        // Keep cached pixels: ScreenCaptureKit stays quiet on a static
+        // display, and the watchdog needs them to force the reconnect IDR.
+        cancelDropReplayTimer()
         // A reconnect can recreate the phone's video view with no cursor
         // sprite; the sprite is otherwise only sent on shape change, so the
         // cursor would stay invisible until the user hovers something that
@@ -533,6 +897,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let params = NWParameters(tls: nil, tcp: options)
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
+        // A dial to a withdrawn Bonjour service (receiver asleep or app
+        // closed) sits in .preparing forever — it neither fails nor resolves
+        // when the service later returns, observed on macOS 26. Give every
+        // dial a deadline and redial fresh: a new NWConnection re-runs
+        // Bonjour resolution, so the retry loop reaches the receiver the
+        // moment it advertises again.
+        let generation = dialGeneration
+        queue.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            guard let self, generation == self.dialGeneration, !self.stopped,
+                  self.connection === conn, conn.state != .ready else { return }
+            Log.info("dial timed out in \(conn.state) — redialing")
+            self.scheduleReconnect()
+        }
         conn.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
@@ -541,6 +918,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             case .failed(let error):
                 Log.info("connection failed: \(error)")
                 self.connectionReady = false
+                if case .posix(let code) = error, code == .ECONNREFUSED {
+                    self.dialRefused()
+                }
                 self.scheduleReconnect()
             case .waiting(let error):
                 // On loopback there is no "path change" to wake us up again
@@ -548,7 +928,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 // waiting as failure and poll by reconnecting.
                 Log.info("connection waiting: \(error) — will retry")
                 self.connectionReady = false
-                Task { await self.status("Waiting for receiver at \(self.endpointName)…") }
+                // Read the queue-confined flag here (handler runs on queue),
+                // not inside the detached status Task.
+                let text = self.awaitingWake
+                    ? "\(self.endpointName) is asleep — reconnects when it wakes…"
+                    : "Waiting for receiver at \(self.endpointName)…"
+                Task { await self.status(text) }
                 self.scheduleReconnect()
             case .cancelled:
                 self.connectionReady = false
@@ -590,19 +975,23 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     self.becomeReady(conn)
                 }
             } catch {
-                // Distinct guidance per failure: cable missing vs app closed.
-                let hint: String
-                switch error as? Usbmux.Failure {
-                case .noDevice:
-                    hint = "Waiting for a USB device — plug in the iPhone or iPad…"
-                case .refused:
-                    hint = "Device found — open the OpenDisplay app on it…"
-                default:
-                    Log.info("usb dial failed: \(error)")
-                    hint = "USB connection failed: \(error.localizedDescription)"
-                }
                 queue.async {
                     guard generation == self.dialGeneration, !self.stopped else { return }
+                    // Distinct guidance per failure: cable missing vs app
+                    // closed. Composed on `queue`: awaitingWake lives there.
+                    let hint: String
+                    switch error as? Usbmux.Failure {
+                    case .noDevice:
+                        hint = "Waiting for a USB device — plug in the iPhone or iPad…"
+                    case .refused:
+                        self.dialRefused()
+                        hint = self.awaitingWake
+                            ? "\(self.endpointName) is asleep — reconnects when it wakes…"
+                            : "Device found — open the OpenDisplay app on it…"
+                    default:
+                        Log.info("usb dial failed: \(error)")
+                        hint = "USB connection failed: \(error.localizedDescription)"
+                    }
                     Task { await self.status(hint) }
                     self.scheduleReconnect()
                 }
@@ -615,8 +1004,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         if everConnected {
             if let since = disconnectedSince {
                 if Date().timeIntervalSince(since) > disconnectGraceSeconds {
-                    Log.info("device gone for >\(Int(disconnectGraceSeconds))s — ending session")
-                    Task { @MainActor in self.onDisconnected?() }
+                    reportGone("device gone for >\(Int(disconnectGraceSeconds))s — ending session")
                     return
                 }
             } else {
@@ -630,6 +1018,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connection?.cancel()
         connection = nil
         pendingSends = 0
+        pipelineLock.lock()
+        pendingEncodes = 0
+        pipelineLock.unlock()
         queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             // Generation-guarded so a switchTransport (or another reconnect)
             // that landed in this 1s window supersedes this dial instead of
@@ -655,7 +1046,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let sorted = self.inputLatencies.sorted()
                 let inp50 = sorted.isEmpty ? 0 : sorted[sorted.count / 2].rounded()
                 let inp95 = sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))].rounded()
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps)}")
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps)}")
             }
             self.schedulePing()
         }
@@ -665,17 +1056,34 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, !self.stopped else { return }
             if self.connectionReady, Date().timeIntervalSince(self.lastReceived) > 5 {
+                // A suspended receiver app (user switched apps) goes silent
+                // like this while its kernel still accepts redials — the
+                // session and display are kept on purpose so the user's
+                // window arrangement survives until they come back. Genuine
+                // network loss fails the redials and ends via the grace.
                 Log.info("watchdog: nothing from the phone for >5s — reconnecting")
-                Task { await self.status("Connection stale — reconnecting…") }
+                // Can't tell a backgrounded receiver from a brief stall here
+                // (both go silent while redials still succeed) — hedge.
+                Task { await self.status("\(self.endpointName) is silent — keeping the display (app in background or brief stall)") }
                 self.scheduleReconnect()
+            }
+            // The disconnect grace is otherwise only evaluated when a dial
+            // changes state — a dial stuck in .preparing (withdrawn Bonjour
+            // service) would keep a dead session's display up forever.
+            // Enforce it from here too, where the clock always ticks.
+            if !self.connectionReady, self.everConnected,
+               let since = self.disconnectedSince,
+               Date().timeIntervalSince(since) > self.disconnectGraceSeconds {
+                self.reportGone("device gone for >\(Int(self.disconnectGraceSeconds))s — ending session")
             }
             // A reconnect on a static screen produces no capture frames, so
             // the receiver would stay black — replay the last frame as IDR.
             if self.connectionReady, self.needsKeyframe,
                Date().timeIntervalSince(self.lastCaptureAt) > 1,
-               let pixelBuffer = self.lastPixelBuffer {
-                Log.info("static screen after reconnect — replaying last frame as keyframe")
-                self.encode(pixelBuffer, pts: CMClockGetTime(CMClockGetHostTimeClock()))
+                let pixelBuffer = self.lastPixelBuffer {
+                Log.info("static screen after reconnect to \(self.endpointName) — replaying last frame as keyframe")
+                self.encode(pixelBuffer, pts: CMClockGetTime(CMClockGetHostTimeClock()),
+                            generation: self.captureGenerationNow)
             }
             self.scheduleWatchdog()
         }
@@ -785,7 +1193,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         lastReceived = Date()
         guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
               let type = obj["type"] as? String else {
-            Log.info("unparseable control message (\(payload.count) bytes)")
+            handleUnparseableControlLogAction(
+                unparseableControlLogPolicy.record(
+                    payload.count,
+                    at: ProcessInfo.processInfo.systemUptime
+                )
+            )
             return
         }
         switch type {
@@ -801,8 +1214,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             // so one file holds both ends of the story.
             if let json = try? JSONSerialization.data(withJSONObject: obj),
                let line = String(data: json, encoding: .utf8) {
-                Log.info("PHONE-STATS \(line) | mac drops=\(dropsThisWindow) pending=\(pendingSends)")
-                dropsThisWindow = 0
+                Log.info("PHONE-STATS \(line) | mac enc↓=\(dropsEncThisWindow) net↓=\(dropsNetThisWindow) pending=\(pendingSends)")
+                dropsEncThisWindow = 0
+                dropsNetThisWindow = 0
             }
         case "hello":
             if let info = try? JSONDecoder().decode(PhoneInfo.self, from: payload) {
@@ -853,13 +1267,61 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
                 inputInjector?.handleScroll(dx: dx, dy: dy)
             }
+        case "pencil":
+            if let phase = obj["phase"] as? String,
+               let x = obj["x"] as? Double,
+               let y = obj["y"] as? Double {
+                inputInjector?.handlePencil(
+                    phase: phase, x: x, y: y,
+                    pressure: obj["pressure"] as? Double ?? 0,
+                    azimuth: obj["azimuth"] as? Double ?? 0,
+                    altitude: obj["altitude"] as? Double ?? (.pi / 2),
+                    rotation: obj["rotation"] as? Double ?? 0)
+                if let t = obj["t"] as? Double {
+                    let delta = Date().timeIntervalSince1970 * 1000 - t
+                    if delta > -50, delta < 1000 {
+                        inputLatencies.append(max(delta, 0))
+                        if inputLatencies.count > 240 { inputLatencies.removeFirst(120) }
+                    }
+                }
+            }
+        case "proximity":
+            if let entering = obj["entering"] as? Bool,
+               let x = obj["x"] as? Double,
+               let y = obj["y"] as? Double {
+                inputInjector?.handleProximity(entering: entering, x: x, y: y)
+            }
         case "kf":
             // The phone's decoder lost sync (e.g. it attached mid-GOP and
             // periodic keyframes are off) — force an IDR on the next frame.
             Log.info("phone requested keyframe")
             needsKeyframe = true
+        case WireMessage.sleeping:
+            // The device locked and is about to close on us. Hand the
+            // session to the controller right away: it tears the virtual
+            // display down (returning the cursor to a visible screen) and
+            // starts a wake-waiting replacement session.
+            Log.info("receiver went to sleep — ending session, reconnect armed for wake")
+            Task { @MainActor in self.onPeerSleeping?() }
+        case WireMessage.closing:
+            // The app on the device is quitting for real — end the session
+            // without the silence grace and without waiting for a wake.
+            Log.info("receiver app closed — ending session")
+            Task { @MainActor in self.onPeerClosed?() }
         default:
-            Log.info("unknown control message type: \(type)")
+            // Unknown types are a normal consequence of the additive wire
+            // protocol: a newer peer can send messages this build predates.
+            // Log each type once per session, never per message. A peer can
+            // drive this at input rates (a pencil stroke is ~240 messages/sec),
+            // so the policy also caps distinct types and reports that cap once.
+            switch unknownTypeLogPolicy.record(type) {
+            case .logType(let type):
+                Log.info("unknown control message type: \(type) — ignoring (logged once)")
+            case .logSuppression(let limit):
+                Log.info("additional unknown control message types suppressed after \(limit) distinct types")
+            case .none:
+                break
+            }
         }
     }
 
@@ -878,15 +1340,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: - Encoder setup
 
-    private func setupEncoder(width: Int, height: Int) {
-        // Low-latency rate control: the hardware encoder emits every frame
-        // immediately instead of pipelining. (`-lowlatency NO` for A/B.)
-        let lowLatency = UserDefaults.standard.object(forKey: "lowlatency") == nil
-            || UserDefaults.standard.bool(forKey: "lowlatency")
+    /// Create the compression session into `encoder`, optionally requiring an
+    /// encoder that supports low-latency rate control.
+    private func createCompressionSession(width: Int, height: Int, lowLatency: Bool) -> OSStatus {
         let spec: CFDictionary? = lowLatency
             ? [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue] as CFDictionary
             : nil
-        VTCompressionSessionCreate(
+        return VTCompressionSessionCreate(
             allocator: nil,
             width: Int32(width), height: Int32(height),
             codecType: kCMVideoCodecType_H264,
@@ -897,9 +1357,40 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             refcon: nil,
             compressionSessionOut: &encoder
         )
+    }
+
+    private func setupEncoder(width: Int, height: Int) throws {
+        // Low-latency rate control: the hardware encoder emits every frame
+        // immediately instead of pipelining. (`-lowlatency NO` for A/B.)
+        let lowLatency = UserDefaults.standard.object(forKey: "lowlatency") == nil
+            || UserDefaults.standard.bool(forKey: "lowlatency")
+        // The spec filters which encoder VideoToolbox is allowed to pick, so an
+        // unsupported key fails creation outright rather than being ignored the
+        // way the properties below are: this key *requires* an encoder that
+        // offers the mode, and Macs whose only encoder is AMD have none (#133).
+        // Retrying without it is close to free — the guarantees the mode makes
+        // (infinite GOP, no reordering, High profile) are all set explicitly
+        // below, and the default rate controller only pipelines when it is fed
+        // faster than real time, which the pendingEncodes backpressure already
+        // prevents. Measured on Apple silicon at a paced 60fps: 5.3ms mean
+        // submit→emit without the spec vs 6.1ms with it, 1 frame held either
+        // way. (Overfeeding it at ~320fps does queue ~8 frames, hence the cap.)
+        var status = createCompressionSession(width: width, height: height, lowLatency: lowLatency)
+        var usedFallback = false
+        if encoder == nil, lowLatency {
+            Log.info("VTCompressionSessionCreate failed with low-latency rate control (status \(status)) — retrying without an encoder specification")
+            status = createCompressionSession(width: width, height: height, lowLatency: false)
+            usedFallback = true
+        }
         guard let encoder else {
-            Log.info("FATAL: VTCompressionSessionCreate failed")
-            return
+            // Returning here used to leave the session "connected, all green"
+            // with a dead encoder and a black receiver. Throw so the failure
+            // reaches the UI as a red "Failed:" status.
+            Log.info("FATAL: VTCompressionSessionCreate failed (status \(status))")
+            throw NSError(domain: "MacSender", code: 4, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "This Mac's video encoder could not be started (VideoToolbox error \(status))"
+            ])
         }
         // Low-latency settings: real-time, no B-frames, periodic keyframes.
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
@@ -914,7 +1405,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
         VTCompressionSessionPrepareToEncodeFrames(encoder)
-        Log.info("encoder ready: \(width)x\(height) H.264 \(quality.bitrate / 1_000_000)Mbps quality=\(quality.rawValue) lowLatencyRC=\(lowLatency)")
+        Log.info("encoder ready: \(width)x\(height) H.264 \(quality.bitrate / 1_000_000)Mbps quality=\(quality.rawValue) lowLatencyRC=\(lowLatency && !usedFallback)\(usedFallback ? " (fallback)" : "")")
     }
 
     // MARK: - Capture callback
@@ -922,36 +1413,105 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream,
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
-        guard type == .screen,
+        guard stream === self.stream,
+              type == .screen,
               CMSampleBufferIsValid(sampleBuffer),
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
+
+        let generation = captureGenerationNow
 
         lastPixelBuffer = pixelBuffer
         lastCaptureAt = Date()
         capFrames += 1
 
-        // No receiver, or the socket is backed up: skip this frame entirely.
+        // No receiver, or a pipeline stage is backed up: skip this frame.
         guard connectionReady else { return }
-        if pendingSends > maxPendingSends {
-            needsKeyframe = true   // dropped frames break the P-frame chain
-            dropsThisWindow += 1
-            dropsTotal += 1
-            return
-        }
+        if shouldDropFrame(reason: "pending_encode") { return }  // encoder busy
+        if shouldDropFrame(reason: "pending_sends") { return }   // TCP send queue full
 
-        encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        encode(pixelBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), generation: generation)
     }
 
-    private func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
-        guard let encoder else { return }
+    private func isPipelineBackedUp() -> Bool {
+        pipelineLock.lock()
+        defer { pipelineLock.unlock() }
+        return pendingEncodes >= maxPendingEncodes || pendingSends >= maxPendingSends
+    }
+
+    /// Schedule (or reset) a one-shot replay of `lastPixelBuffer` after drops.
+    private func scheduleDropReplayTimer() {
+        dropReplayTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .milliseconds(30))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.dropReplayTimer = nil
+            self.replayLastFrameAfterDrop()
+        }
+        timer.resume()
+        dropReplayTimer = timer
+    }
+
+    private func cancelDropReplayTimer() {
+        dropReplayTimer?.cancel()
+        dropReplayTimer = nil
+    }
+
+    /// Re-encode the most recent pixel buffer once backpressure clears.
+    private func replayLastFrameAfterDrop() {
+        guard !stopped, connectionReady, let pixelBuffer = lastPixelBuffer else { return }
+        if isPipelineBackedUp() {
+            scheduleDropReplayTimer()
+            return
+        }
+        encode(pixelBuffer, pts: CMClockGetTime(CMClockGetHostTimeClock()),
+               generation: captureGenerationNow)
+    }
+
+    /// Drop when encode or send pipeline is busy.
+    /// Pre-encode drops are invisible to the decoder — the H.264 reference
+    /// chain stays intact, so the next frame can be a normal P-frame (n → n+2).
+    /// Do NOT force keyframes here; that causes IDR pulsing / blockiness.
+    private func shouldDropFrame(reason: String) -> Bool {
+        pipelineLock.lock()
+        let drop: Bool
+        switch reason {
+        case "pending_encode":
+            drop = pendingEncodes >= maxPendingEncodes
+        case "pending_sends":
+            drop = pendingSends >= maxPendingSends
+        default:
+            drop = false
+        }
+        pipelineLock.unlock()
+        guard drop else { return false }
+        scheduleDropReplayTimer()
+        switch reason {
+        case "pending_encode":
+            dropsEncThisWindow += 1
+            dropsEncTotal += 1
+        case "pending_sends":
+            dropsNetThisWindow += 1
+            dropsNetTotal += 1
+        default:
+            break
+        }
+        return true
+    }
+
+    private func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, generation: UInt64) {
+        guard generation == captureGenerationNow, let encoder else { return }
+        pipelineLock.lock()
+        pendingEncodes += 1
+        pipelineLock.unlock()
         let capturedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
         var frameProperties: CFDictionary?
         if needsKeyframe {
             frameProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary
             needsKeyframe = false
         }
-        VTCompressionSessionEncodeFrame(
+        let submitStatus = VTCompressionSessionEncodeFrame(
             encoder,
             imageBuffer: pixelBuffer,
             presentationTimeStamp: pts,
@@ -959,17 +1519,125 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             frameProperties: frameProperties,
             infoFlagsOut: nil
         ) { [weak self] status, _, buffer in
-            guard status == noErr, let buffer, let self else { return }
+            guard let self else { return }
+            defer {
+                self.pipelineLock.lock()
+                self.pendingEncodes = max(0, self.pendingEncodes - 1)
+                self.pipelineLock.unlock()
+            }
+            guard status == noErr, let buffer else {
+                // A session rejecting every frame looks healthy in all other
+                // counters — the receiver just stays black. Don't be silent.
+                self.pipelineLock.lock()
+                let logAction = self.encodeOutputFailureLogPolicy.record(
+                    status,
+                    at: ProcessInfo.processInfo.systemUptime
+                )
+                self.pipelineLock.unlock()
+                self.handleEncodeOutputFailureLogAction(logAction)
+                return
+            }
+            guard generation == self.captureGenerationNow else { return }
             if let data = self.annexB(from: buffer) {
-                // Telemetry prefix before the first start code — the receiver
-                // parses it and skips to the H.264 payload. cap = capture time,
-                // snd = handoff to the socket (so cap→snd ≈ encode duration).
                 let sndMs = Int64(Date().timeIntervalSince1970 * 1000)
                 var framed = Data("{\"cap\":\(capturedAtMs),\"snd\":\(sndMs)}".utf8)
                 framed.append(data)
                 self.sendFramed(framed)
             }
         }
+        if submitStatus == noErr {
+            // Encode submission commits this frame to the pipeline; stale in-flight
+            // encodes started before a drop won't reach here again, so cancel replay.
+            cancelDropReplayTimer()
+        } else {
+            pipelineLock.lock()
+            pendingEncodes = max(0, pendingEncodes - 1)
+            // A dead encoder session keeps failing, and this runs per frame, so
+            // an unthrottled line here is ~60/sec for as long as the problem
+            // lasts. Report at most once a second and carry the count: the
+            // status code is the diagnosis, the rate is just a number.
+            let logAction = encodeFailureLogPolicy.record(
+                submitStatus,
+                at: ProcessInfo.processInfo.systemUptime
+            )
+            pipelineLock.unlock()
+            handleEncodeFailureLogAction(logAction)
+        }
+    }
+
+    private func handleEncodeFailureLogAction(_ action: ThrottledLogPolicy<OSStatus>.Action) {
+        switch action {
+        case .report(let report):
+            reportEncodeFailures(report)
+        case .schedule(let delay):
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.flushEncodeFailureLog()
+            }
+        case .none:
+            break
+        }
+    }
+
+    private func flushEncodeFailureLog() {
+        pipelineLock.lock()
+        let report = encodeFailureLogPolicy.flush(at: ProcessInfo.processInfo.systemUptime)
+        pipelineLock.unlock()
+        if let report { reportEncodeFailures(report) }
+    }
+
+    private func reportEncodeFailures(_ report: ThrottledLogPolicy<OSStatus>.Report) {
+        Log.info("VTCompressionSessionEncodeFrame failed: \(report.detail) (\(report.count) since last report)")
+    }
+
+    private func handleEncodeOutputFailureLogAction(_ action: ThrottledLogPolicy<OSStatus>.Action) {
+        switch action {
+        case .report(let report):
+            reportEncodeOutputFailures(report)
+        case .schedule(let delay):
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.flushEncodeOutputFailureLog()
+            }
+        case .none:
+            break
+        }
+    }
+
+    private func flushEncodeOutputFailureLog() {
+        pipelineLock.lock()
+        let report = encodeOutputFailureLogPolicy.flush(at: ProcessInfo.processInfo.systemUptime)
+        pipelineLock.unlock()
+        if let report { reportEncodeOutputFailures(report) }
+    }
+
+    private func reportEncodeOutputFailures(_ report: ThrottledLogPolicy<OSStatus>.Report) {
+        // VideoToolbox can reject a frame with noErr + a nil buffer (e.g.
+        // above the H.264 level pixel-rate ceiling) — call that case out.
+        let cause = report.detail == noErr ? "nil buffer despite noErr" : "status \(report.detail)"
+        Log.info("encoder output rejected: \(cause) (\(report.count) since last report)")
+    }
+
+    // Runs on `queue`, where the policy and the control connection both live.
+    private func handleUnparseableControlLogAction(_ action: ThrottledLogPolicy<Int>.Action) {
+        switch action {
+        case .report(let report):
+            reportUnparseableControl(report)
+        case .schedule(let delay):
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.flushUnparseableControlLog()
+            }
+        case .none:
+            break
+        }
+    }
+
+    private func flushUnparseableControlLog() {
+        if let report = unparseableControlLogPolicy.flush(at: ProcessInfo.processInfo.systemUptime) {
+            reportUnparseableControl(report)
+        }
+    }
+
+    private func reportUnparseableControl(_ report: ThrottledLogPolicy<Int>.Report) {
+        Log.info("unparseable control message (\(report.detail) bytes, \(report.count) since last report)")
     }
 
     // MARK: - H.264 -> Annex B
@@ -1088,5 +1756,18 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func status(_ text: String) async {
         await MainActor.run { onStatus?(text) }
+    }
+
+    /// Invalidate the retired ScreenCaptureKit/VideoToolbox callbacks before
+    /// changing the display or encoder they feed.
+    private func invalidateCapturePipeline(discardingLastFrame: Bool = false) {
+        pipelineLock.lock()
+        captureGeneration &+= 1
+        pipelineLock.unlock()
+        captureDisplayID = 0
+        if discardingLastFrame {
+            lastPixelBuffer = nil
+            lastCaptureAt = .distantPast
+        }
     }
 }

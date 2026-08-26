@@ -1,5 +1,107 @@
 # Changelog
 
+## [1.17.0](https://github.com/peetzweg/opendisplay/compare/v1.16.1...v1.17.0) (2026-08-20)
+
+
+### Features
+
+* **ios:** share the phone's connection log from Settings & Help ([#227](https://github.com/peetzweg/opendisplay/issues/227)) ([ba2ddb2](https://github.com/peetzweg/opendisplay/commit/ba2ddb2ceae30577a1d872f12425aa18a1cd3bde))
+
+
+### Bug Fixes
+
+* Honor the system capture stop and survive poisoned display identities ([#231](https://github.com/peetzweg/opendisplay/issues/231)) ([87b000b](https://github.com/peetzweg/opendisplay/commit/87b000b9906587d793c642e0dcd1b1032069f2e8))
+
+## [1.16.1](https://github.com/peetzweg/opendisplay/compare/v1.16.0...v1.16.1) (2026-08-10)
+
+
+### Bug Fixes
+
+* Prevent Mac & iOS device displays from diverging due to dropped frames ([#207](https://github.com/peetzweg/opendisplay/issues/207)) ([c8b2417](https://github.com/peetzweg/opendisplay/commit/c8b24177cbab6df58bfc727873261c53a412cb89))
+
+## [1.16.0](https://github.com/peetzweg/opendisplay/compare/v1.15.0...v1.16.0) (2026-08-08)
+
+
+### Features
+
+* **web:** add compatible apps section to the landing page ([#200](https://github.com/peetzweg/opendisplay/issues/200)) ([3d68908](https://github.com/peetzweg/opendisplay/commit/3d68908808d9b8bfe97a0bad3e1ce0e7e61f43df))
+
+
+### Bug Fixes
+
+* **mac:** fall back to a nil encoderSpecification when creation fails ([#197](https://github.com/peetzweg/opendisplay/issues/197)) ([#202](https://github.com/peetzweg/opendisplay/issues/202)) ([d9eb302](https://github.com/peetzweg/opendisplay/commit/d9eb302d4d25e2c72847420d5e462ff035520e49))
+* **mac:** log rejected encodes instead of dropping them silently ([#118](https://github.com/peetzweg/opendisplay/issues/118)) ([215100d](https://github.com/peetzweg/opendisplay/commit/215100d09477712f75cfd6684a13cc6a68d0edc8))
+* **mac:** preserve virtual displays across rotation ([#210](https://github.com/peetzweg/opendisplay/issues/210)) ([2a4abf7](https://github.com/peetzweg/opendisplay/commit/2a4abf7408866dec05e8461cf7086e8059cda877)), closes [#203](https://github.com/peetzweg/opendisplay/issues/203)
+* **mac:** re-attach capture on stream death instead of full display rebuild ([#29](https://github.com/peetzweg/opendisplay/issues/29)) ([#157](https://github.com/peetzweg/opendisplay/issues/157)) ([ceebb2d](https://github.com/peetzweg/opendisplay/commit/ceebb2d46130c8aac912439279d7b1f71c851e31))
+
+## [1.15.0](https://github.com/peetzweg/opendisplay/compare/v1.14.0...v1.15.0) (2026-08-02)
+
+
+### Features
+
+* **ios:** Apple Pencil input with pressure, tilt and proximity ([#163](https://github.com/peetzweg/opendisplay/issues/163)) ([1c857a4](https://github.com/peetzweg/opendisplay/commit/1c857a4ebd26080aedeba3086b7bee02a0a5a6c1))
+
+
+### Bug Fixes
+
+* **input:** stop two-finger scroll from firing a click ([#188](https://github.com/peetzweg/opendisplay/issues/188)) ([04590ed](https://github.com/peetzweg/opendisplay/commit/04590ed1871f533108d8a81f498df188c69f249c))
+* **mac:** bound the log, throttle hot log paths, make it easy to send ([#180](https://github.com/peetzweg/opendisplay/issues/180)) ([19481a6](https://github.com/peetzweg/opendisplay/commit/19481a66aa7015eaf3830737bfb3cf43f105250d))
+
+## [1.14.0](https://github.com/peetzweg/opendisplay/compare/v1.13.0...v1.14.0) (2026-07-30)
+
+
+### Features
+
+* **ios:** lower deployment target to iOS 16 ([#178](https://github.com/peetzweg/opendisplay/issues/178)) ([518b62d](https://github.com/peetzweg/opendisplay/commit/518b62d656a154f128f3e8bc677a9ad39004b7e5))
+
+## [1.13.0](https://github.com/peetzweg/opendisplay/compare/v1.12.1...v1.13.0) (2026-07-21)
+
+
+### Features
+
+* end the session when the receiver sleeps, reconnect on wake ([#166](https://github.com/peetzweg/opendisplay/issues/166)) ([e7eb0e5](https://github.com/peetzweg/opendisplay/commit/e7eb0e57ede6bab10a31968dc66428cc266f9f9e))
+
+## [1.12.1](https://github.com/peetzweg/opendisplay/compare/v1.12.0...v1.12.1) (2026-07-21)
+
+
+### Performance Improvements
+
+* reduce lag spikes when scrolling or drawing fast ([#162](https://github.com/peetzweg/opendisplay/issues/162)) ([0490441](https://github.com/peetzweg/opendisplay/commit/0490441cf147fe8c5f7d13e2f17333aae7544047))
+
+## [1.12.0](https://github.com/peetzweg/opendisplay/compare/v0.11.0...v1.12.0) (2026-07-12)
+
+
+### Features
+
+* **ios:** add remote-config force-update gate ([#135](https://github.com/peetzweg/opendisplay/issues/135)) ([b4133f2](https://github.com/peetzweg/opendisplay/commit/b4133f25e27c6f8937b4cbf4b3985b82265068f7))
+* **mac:** seamless transport switching between USB and WiFi ([8fecc3c](https://github.com/peetzweg/opendisplay/commit/8fecc3c4147da4778ce0111c55eb1aecd6bde22a))
+* **protocol:** add version handshake on the wire ([#132](https://github.com/peetzweg/opendisplay/issues/132)) ([d506e6c](https://github.com/peetzweg/opendisplay/commit/d506e6cfc9c8ac43b5e56093ea5665df9426d86b))
+* **web:** add four community posts to demo showcase ([3f13f9c](https://github.com/peetzweg/opendisplay/commit/3f13f9c0ef71fe666fadd46b48fe14887cba42c1))
+* **web:** add Ko-fi support nudge banner under downloads ([10bfcdc](https://github.com/peetzweg/opendisplay/commit/10bfcdcceda08d6a948f14fed7e070cee717aba0))
+* **web:** center hero Ko-fi nudge, move second to end of demo section ([d2256d4](https://github.com/peetzweg/opendisplay/commit/d2256d43e48292a4d4dd5297a8ece1b035430fdf))
+* **web:** drop side borders on mobile Ko-fi nudge, keep top/bottom band ([2dd6b26](https://github.com/peetzweg/opendisplay/commit/2dd6b267514333394ffb4c8d54b0aa79ed17bc61))
+* **web:** extract Ko-fi nudge into repeatable borderless SupportNudge section ([b12e00b](https://github.com/peetzweg/opendisplay/commit/b12e00b6202a5ec13995b5d9c278ce3f8db029e8))
+* **web:** move Ko-fi nudge above downloads, drop hero support hint ([ca37938](https://github.com/peetzweg/opendisplay/commit/ca37938dc05767ffafd388dd223dab8a17ddd855))
+* **web:** place sticky Ko-fi bar between hero and downloads section ([7c0f1e7](https://github.com/peetzweg/opendisplay/commit/7c0f1e776a41ef938a422e7c962dc9e5ee6a685a))
+* **web:** revert Ko-fi nudge to centered bordered pill (drop full-width bar) ([a3e2b1d](https://github.com/peetzweg/opendisplay/commit/a3e2b1d1a12a9de5db57ea21485bf70341e6f111))
+* **web:** show Ko-fi nudge both above (left) and below (centered) downloads ([66c1923](https://github.com/peetzweg/opendisplay/commit/66c192395f83e4c887fbbdc9d3870b5bd9a0ec91))
+* **web:** single full-width sticky Ko-fi bar above downloads; unsticks at support; pointer cursor on support button ([2523672](https://github.com/peetzweg/opendisplay/commit/25236724858b49eac37b066571258f9fc449b6d2))
+* **web:** sticky Ko-fi support nudge between hero and downloads ([15a18e7](https://github.com/peetzweg/opendisplay/commit/15a18e771303648563e968b2778895ac361fdc03))
+
+
+### Bug Fixes
+
+* **mac:** cancel virtual display retry on disconnect ([a131076](https://github.com/peetzweg/opendisplay/commit/a131076892780d0a9dcdc12aa9047d1240598999))
+* **mac:** generation-guard the reconnect dial ([79452c7](https://github.com/peetzweg/opendisplay/commit/79452c7bef3e9b356d5e72b7401a8d4d9025cad2))
+* **mac:** latest arrangement wins across orientation flips ([ad7800d](https://github.com/peetzweg/opendisplay/commit/ad7800dcb12a4557bd07a8481f7913da3b762fdd))
+* **mac:** remember virtual display arrangement across reconnects ([72d4578](https://github.com/peetzweg/opendisplay/commit/72d45781c05ce9cf43e38476460e3b32977e17b6)), closes [#116](https://github.com/peetzweg/opendisplay/issues/116)
+* **mac:** retry virtual display creation while a stale serial lingers ([8acc36c](https://github.com/peetzweg/opendisplay/commit/8acc36c3690351cd74541e0cf583c80c578435ef))
+
+
+### Miscellaneous Chores
+
+* release 1.12.0 ([5dc7b31](https://github.com/peetzweg/opendisplay/commit/5dc7b31ed6b3d6c19a4bebabe7e8ffa1981eafc4))
+
 ## [0.11.0](https://github.com/peetzweg/opendisplay/compare/v0.10.1...v0.11.0) (2026-07-07)
 
 

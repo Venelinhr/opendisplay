@@ -91,7 +91,7 @@ struct ReceiverScreen: View {
                 }
             }
             .onAppear { model.receiver.setOrientation(portrait: geo.size.height > geo.size.width) }
-            .onChange(of: geo.size) { _, size in
+            .onChange(of: geo.size) { size in
                 model.receiver.setOrientation(portrait: size.height > size.width)
             }
             .sheet(isPresented: $showOnboarding) {
@@ -126,11 +126,37 @@ struct ReceiverScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: .deviceDidShake)) { _ in
             showSettings = true
         }
-        .onChange(of: scenePhase) { _, phase in
-            // iOS may tear the listener down while suspended — recover.
-            if phase == .active { model.receiver.ensureListening() }
+        .onChange(of: scenePhase) { phase in
+            Log.info("scenePhase -> \(String(describing: phase))")
+            switch phase {
+            case .active: model.sceneDidActivate()
+            case .background: model.sceneDidBackground()
+            default: break
+            }
         }
-        .onChange(of: model.receiver.connected) { _, isConnected in
+        // The deliberate "screen off" signal: locking the device makes
+        // protected data unavailable (a plain app switch doesn't). This is
+        // what separates "put the iPhone to sleep — end the session now"
+        // from "peeked at a message — keep the session alive".
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.protectedDataWillBecomeUnavailableNotification)) { _ in
+            Log.info("protected data will become unavailable (device locking)")
+            model.deviceWillLock()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
+            Log.info("protected data available again (device unlocked)")
+            model.deviceDidUnlock()
+        }
+        // Swiping the app away in the switcher (while we're still running)
+        // grants a ~5s notice — enough for a clean goodbye so the Mac ends
+        // the session at once. A kill without notice is covered Mac-side:
+        // dead apps stop accepting redials, so the silence grace fires.
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.willTerminateNotification)) { _ in
+            model.appWillTerminate()
+        }
+        .onChange(of: model.receiver.connected) { isConnected in
             // The first valid connection retires the onboarding hint for good.
             if isConnected {
                 hasConnectedBefore = true
@@ -339,6 +365,18 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    NavigationLink {
+                        DiagnosticsLogView()
+                    } label: {
+                        Label("Connection log", systemImage: "doc.text.magnifyingglass")
+                    }
+                } header: {
+                    Text("Diagnostics")
+                } footer: {
+                    Text("What this \(deviceKind) saw while connecting: sessions, restarts, decoder trouble. No screen content and nothing leaves the \(deviceKind) unless you share it. Attach it to a GitHub issue if a connection won't come up.")
+                }
+
+                Section {
                     Label("USB: plug in the cable, run the Mac app — it connects automatically through the wire (lowest latency).",
                           systemImage: "cable.connector")
                     Label("WiFi: both devices on the same network, then pick this \(deviceKind) in the Mac app's Connection menu.",
@@ -392,7 +430,7 @@ private struct DeviceNameField: View {
             .textInputAutocapitalization(.words)
             .autocorrectionDisabled()
             .focused($focused)
-            .onChange(of: deviceName) { _, name in onChange(name) }
+            .onChange(of: deviceName) { name in onChange(name) }
     }
 }
 
@@ -425,6 +463,105 @@ final class ReceiverModel: ObservableObject {
         guard !started else { return }
         started = true
         receiver.start(port: 9000)
+    }
+
+    // MARK: - Lock vs app switch vs app quit
+
+    // A plain app switch keeps the session (and the Mac's virtual display,
+    // and therefore the user's window arrangement) alive INDEFINITELY. The
+    // assertion buys ~30s of live pings; after iOS suspends us the kernel
+    // still accepts the Mac's redials, so the session survives untouched
+    // until we return. Only a device lock (deliberate "screen off") or the
+    // app being quit ends the session. Known hole: a lock that happens
+    // after we're already suspended is undetectable — no code runs and the
+    // kernel behaves identically — so the display stays up until the user
+    // returns or the app dies.
+    private var backgroundToken: UIBackgroundTaskIdentifier = .invalid
+
+    func sceneDidBackground() {
+        // Known limitation: lock detection rides the protected-data signal,
+        // which only fires when a passcode is set AND "Require Passcode" is
+        // Immediately (the Face ID default). Other configurations make a
+        // lock indistinguishable from an app switch, so those keep the
+        // session like a backgrounded app would.
+        if !UIApplication.shared.isProtectedDataAvailable {
+            // Backgrounded because the device locked, not an app switch.
+            Log.info("backgrounded by device lock — sleeping now")
+            goToSleep()
+            return
+        }
+        Log.info("app switched away — keeping the session, rendering paused")
+        beginBackgroundAssertion()
+        receiver.setRenderingPaused(true)
+    }
+
+    func sceneDidActivate() {
+        endBackgroundAssertion()
+        receiver.setRenderingPaused(false)
+        receiver.ensureListening()
+    }
+
+    func deviceWillLock() {
+        Log.info("device locking — sleeping now")
+        goToSleep()
+    }
+
+    /// Unlock arrives via the protected-data notification, which also fires
+    /// when the user unlocks into ANOTHER app while we sit in the background
+    /// — don't re-arm the listener or unpause rendering off-screen there;
+    /// the real return still comes through scenePhase.
+    func deviceDidUnlock() {
+        guard UIApplication.shared.applicationState == .active else {
+            Log.info("unlocked while backgrounded — staying dormant")
+            return
+        }
+        sceneDidActivate()
+    }
+
+    /// User swiped the app away (or iOS terminates us while still running):
+    /// ~5s of runtime remain, plenty for the "closing" goodbye that lets the
+    /// Mac end the session immediately instead of after its silence grace.
+    func appWillTerminate() {
+        Log.info("app terminating — closing session")
+        receiver.shutDown()
+    }
+
+    private func goToSleep() {
+        receiver.enterSleep { [weak self] in
+            DispatchQueue.main.async { self?.endBackgroundAssertion() }
+        }
+    }
+
+    private func beginBackgroundAssertion() {
+        guard backgroundToken == .invalid else { return }
+        backgroundToken = UIApplication.shared.beginBackgroundTask { [weak self] in
+            // Suspension takes us now; the session stays up by design (the
+            // kernel keeps accepting for us) — just release the assertion.
+            self?.endBackgroundAssertion()
+        }
+    }
+
+    private func endBackgroundAssertion() {
+        guard backgroundToken != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundToken)
+        backgroundToken = .invalid
+    }
+}
+
+// MARK: - Touch sampling
+
+extension UIEvent {
+    /// Every position UIKit recorded for `touch` in this update, oldest first.
+    ///
+    /// The panel samples faster than UIKit delivers, so a single `touchesMoved`
+    /// stands for several real positions. This batch is that whole history and
+    /// its *last* entry is `touch` itself, so forward the list as it comes:
+    /// sending `touch` alongside it puts the newest sample ahead of its own
+    /// history and emits it twice, which reads as backtracking on fast strokes.
+    /// Falls back to the touch alone when UIKit coalesced nothing.
+    func samples(for touch: UITouch) -> [UITouch] {
+        let batch = coalescedTouches(for: touch) ?? []
+        return batch.isEmpty ? [touch] : batch
     }
 }
 
@@ -460,6 +597,17 @@ struct VideoLayerView: UIViewRepresentable {
             view.layer.addSublayer(displayLayer)
         }
 
+        view.inputEngine.normalize = { [weak view] point in view?.normalized(point) }
+        view.inputEngine.onPencil = { [weak receiver] phase, x, y, pressure, azimuth, altitude in
+            receiver?.sendPencil(phase: phase, x: x, y: y,
+                                 pressure: pressure, azimuth: azimuth,
+                                 altitude: altitude)
+        }
+        view.inputEngine.onProximity = { [weak receiver] entering, x, y in
+            receiver?.sendProximity(entering: entering, x: x, y: y)
+        }
+        view.inputEngine.install(on: view)
+
         let pan = UIPanGestureRecognizer(target: view, action: #selector(VideoView.didTwoFingerPan(_:)))
         pan.minimumNumberOfTouches = 2
         pan.maximumNumberOfTouches = 2
@@ -492,6 +640,7 @@ struct VideoLayerView: UIViewRepresentable {
     final class VideoView: UIView {
         weak var receiver: StreamReceiver?
         var metalRenderer: MetalVideoRenderer?
+        let inputEngine = InputCaptureEngine()
 
         private let cursorLayer: CALayer = {
             let layer = CALayer()
@@ -578,7 +727,7 @@ struct VideoLayerView: UIViewRepresentable {
 
         // The video is aspect-fit inside the view; map view coords into the
         // displayed video rect and normalize to [0,1].
-        private func normalized(_ point: CGPoint) -> (x: Double, y: Double)? {
+        fileprivate func normalized(_ point: CGPoint) -> (x: Double, y: Double)? {
             guard let video = receiver?.videoSize, video != .zero,
                   bounds.width > 0, bounds.height > 0 else { return nil }
             let scale = min(bounds.width / video.width, bounds.height / video.height)
@@ -588,6 +737,17 @@ struct VideoLayerView: UIViewRepresentable {
             let x = (point.x - origin.x) / size.width
             let y = (point.y - origin.y) / size.height
             return (min(max(x, 0), 1), min(max(y, 0), 1))
+        }
+
+        private func isFinger(_ touch: UITouch) -> Bool {
+            switch touch.type {
+            case .direct, .indirectPointer: return true
+            default: return false
+            }
+        }
+
+        private func isPencil(_ touch: UITouch) -> Bool {
+            touch.type == .pencil
         }
 
         private var twoFingerActive = false
@@ -600,6 +760,16 @@ struct VideoLayerView: UIViewRepresentable {
             case .began:
                 twoFingerActive = true
                 lastPan = .zero
+                // macOS delivers scroll to whatever sits under the cursor, and
+                // the cursor no longer follows the fingers now that a press is
+                // withheld until it commits. Put it on the gesture once, up
+                // front, so the scroll lands on the window being touched. Once
+                // only: a real trackpad does not drag the cursor while
+                // scrolling, and moving it mid-gesture would change the target.
+                if let n = normalized(recognizer.location(in: self)) {
+                    lastNorm = n
+                    receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
+                }
             case .changed:
                 let t = recognizer.translation(in: self)
                 let scale = min(bounds.width / video.width, bounds.height / video.height)
@@ -612,25 +782,102 @@ struct VideoLayerView: UIViewRepresentable {
             }
         }
 
+        // A press is only a click once we know a second finger is not coming.
+        // Sending `began` on contact posted a mouse-down we then had to take
+        // back, and taking it back only works when UIKit happens to deliver
+        // `cancelled`; when the pan recognizer misses and we get a plain
+        // `ended` instead, that down/up pair *is* a click, which is why every
+        // other two-finger scroll opened whatever sat under the first finger.
+        // So hold the down until the gesture commits to being one.
+        private var pendingDown: (x: Double, y: Double)?
+        private var downSent = false
+        private var holdTimer: DispatchWorkItem?
+
+        /// Movement (in points) that turns a held press into a drag.
+        private let dragSlop: CGFloat = 10
+        /// A press this long with no second finger is a deliberate hold, so
+        /// commit it: press-and-hold menus and drag handles need the button.
+        private let holdDelay: TimeInterval = 0.12
+        private var pendingDownPoint: CGPoint = .zero
+
+        /// Emit the withheld `began`, at the point the finger first landed so a
+        /// drag starts where the user touched rather than where slop was crossed.
+        private func commitPendingDown() {
+            guard let p = pendingDown, !downSent else { return }
+            downSent = true
+            holdTimer?.cancel()
+            holdTimer = nil
+            receiver?.sendTouch(phase: "began", x: p.x, y: p.y)
+        }
+
+        /// Drop the press without a trace. Nothing reached the Mac, so there is
+        /// no button to release and no click to suppress.
+        private func discardPendingDown() {
+            pendingDown = nil
+            downSent = false
+            holdTimer?.cancel()
+            holdTimer = nil
+        }
+
         private func send(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
+            let fingers = touches.filter { isFinger($0) }
+            guard !fingers.isEmpty else { return }
             // Ignore single-finger events while a two-finger gesture runs,
             // and end the click if a second finger joins mid-press.
-            if twoFingerActive || (event?.allTouches?.count ?? 1) > 1 {
-                if phase != "began" {
+            if twoFingerActive || (event?.allTouches?.filter { isFinger($0) }.count ?? 1) > 1 {
+                if downSent {
                     receiver?.sendTouch(phase: "cancelled", x: lastNorm.x, y: lastNorm.y)
                 }
+                discardPendingDown()
                 return
             }
-            guard let touch = touches.first,
+            guard let touch = fingers.first,
                   let norm = normalized(touch.location(in: self)) else { return }
             lastNorm = norm
+
+            switch phase {
+            case "began":
+                let location = touch.location(in: self)
+                pendingDown = norm
+                pendingDownPoint = location
+                downSent = false
+                let work = DispatchWorkItem { [weak self] in self?.commitPendingDown() }
+                holdTimer = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + holdDelay, execute: work)
+                return
+            case "ended":
+                // A tap: nothing was posted yet, so post the whole click now.
+                if pendingDown != nil, !downSent { commitPendingDown() }
+                // No down means the press was already discarded (a second
+                // finger took it), so there is nothing to release.
+                if downSent { receiver?.sendTouch(phase: "ended", x: norm.x, y: norm.y) }
+                discardPendingDown()
+                return
+            case "cancelled":
+                if downSent {
+                    receiver?.sendTouch(phase: "cancelled", x: norm.x, y: norm.y)
+                }
+                discardPendingDown()
+                return
+            case "moved":
+                if pendingDown != nil, !downSent {
+                    let moved = hypot(touch.location(in: self).x - pendingDownPoint.x,
+                                      touch.location(in: self).y - pendingDownPoint.y)
+                    // Below slop the finger is still deciding: track the cursor
+                    // (the Mac turns a move without a down into mouseMoved) but
+                    // keep the button up so a second finger can still cancel.
+                    if moved > dragSlop { commitPendingDown() }
+                }
+            default:
+                break
+            }
+
             if phase == "moved", let event {
-                // The panel samples touches at 120Hz but UIKit delivers at
-                // display refresh — forward every coalesced sample so the Mac
-                // gets the full-rate drag, then UIKit's predicted touch so the
-                // cursor leads toward where the finger will be (~1 frame of
-                // perceived latency back; corrected by the next real sample).
-                for t in event.coalescedTouches(for: touch) ?? [touch] {
+                // Forward every coalesced sample so the Mac gets the full-rate
+                // drag, then UIKit's predicted touch so the cursor leads toward
+                // where the finger will be (~1 frame of perceived latency back;
+                // corrected by the next real sample).
+                for t in event.samples(for: touch) {
                     if let n = normalized(t.location(in: self)) {
                         lastNorm = n
                         receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
@@ -645,9 +892,166 @@ struct VideoLayerView: UIViewRepresentable {
             receiver?.sendTouch(phase: phase, x: norm.x, y: norm.y)
         }
 
-        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) { send("began", touches, event) }
-        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) { send("moved", touches, event) }
-        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { send("ended", touches, event) }
-        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { send("cancelled", touches, event) }
+        private func sendPencilAsTouch(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
+            guard let touch = touches.first,
+                  let norm = normalized(touch.location(in: self)) else { return }
+            lastNorm = norm
+            if phase == "moved", let event {
+                for t in event.samples(for: touch) {
+                    if let n = normalized(t.location(in: self)) {
+                        lastNorm = n
+                        receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
+                    }
+                }
+                if let predicted = event.predictedTouches(for: touch)?.last,
+                   let n = normalized(predicted.location(in: self)) {
+                    receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
+                }
+                return
+            }
+            receiver?.sendTouch(phase: phase, x: norm.x, y: norm.y)
+        }
+
+        private func routeTouches(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?, ended: Bool) {
+            let pencil = touches.filter { isPencil($0) }
+            let finger = touches.filter { isFinger($0) }
+            let usePencilWire = receiver?.macSupportsPencilWire ?? false
+
+            if !pencil.isEmpty {
+                if usePencilWire {
+                    inputEngine.handle(pencil, event: event, ended: ended)
+                } else {
+                    sendPencilAsTouch(phase, pencil, event)
+                }
+            }
+            // Palm rejection: ignore resting fingers while the pen is down.
+            if !finger.isEmpty && !inputEngine.hasActivePen {
+                send(phase, finger, event)
+            }
+        }
+
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+            routeTouches("began", touches, event, ended: false)
+        }
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+            routeTouches("moved", touches, event, ended: false)
+        }
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+            routeTouches("ended", touches, event, ended: true)
+        }
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+            routeTouches("cancelled", touches, event, ended: true)
+        }
+    }
+}
+
+// MARK: - Apple Pencil capture
+
+/// Captures Apple Pencil hover and stroke on a host view.
+/// Finger touches stay on VideoView's existing `touch` wire path.
+///
+/// TODO: Capture Apple Pencil Pro barrel roll (UIKit rollAngle, iOS 17.5+) once
+/// hardware is available for testing.
+final class InputCaptureEngine: NSObject {
+    var onPencil: ((_ phase: String, _ x: Double, _ y: Double,
+                    _ pressure: Double, _ azimuth: Double, _ altitude: Double) -> Void)?
+    var onProximity: ((_ entering: Bool, _ x: Double, _ y: Double) -> Void)?
+
+    /// True while at least one pen contact is on the glass (palm rejection).
+    var hasActivePen: Bool { !activePens.isEmpty }
+
+    /// Map a point in the host view to normalized video coordinates.
+    var normalize: ((CGPoint) -> (x: Double, y: Double)?)?
+
+    private weak var hostView: UIView?
+    private var activePens: Set<UInt64> = []
+    private var proximityActive = false
+
+    func install(on view: UIView) {
+        hostView = view
+        view.isMultipleTouchEnabled = true
+
+        let hover = UIHoverGestureRecognizer(target: self, action: #selector(hoverChanged(_:)))
+        hover.allowedTouchTypes = [UITouch.TouchType.pencil.rawValue as NSNumber]
+        view.addGestureRecognizer(hover)
+    }
+
+    @objc private func hoverChanged(_ gr: UIHoverGestureRecognizer) {
+        guard activePens.isEmpty, let view = hostView else { return }
+        guard let n = normalize?(gr.location(in: view)) else { return }
+        switch gr.state {
+        case .began:
+            openProximity(x: n.x, y: n.y)
+            fallthrough
+        case .changed:
+            let azimuth = Double(gr.azimuthAngle(in: view))
+            let altitude = Double(gr.altitudeAngle)
+            onPencil?("hover", n.x, n.y, 0, azimuth, altitude)
+        case .ended, .cancelled, .failed:
+            guard activePens.isEmpty else { return }
+            closeProximity(x: n.x, y: n.y)
+        default:
+            break
+        }
+    }
+
+    func handle(_ touches: Set<UITouch>, event: UIEvent?, ended: Bool) {
+        guard hostView != nil else { return }
+        for touch in touches where touch.type == .pencil {
+            emitPen(touch, event: event, ended: ended)
+        }
+    }
+
+    private func openProximity(x: Double, y: Double) {
+        guard !proximityActive else { return }
+        proximityActive = true
+        onProximity?(true, x, y)
+    }
+
+    private func closeProximity(x: Double, y: Double) {
+        guard proximityActive else { return }
+        proximityActive = false
+        onProximity?(false, x, y)
+    }
+
+    private func emitPen(_ touch: UITouch, event: UIEvent?, ended: Bool) {
+        guard let view = hostView else { return }
+        let id = UInt64(bitPattern: Int64(ObjectIdentifier(touch).hashValue))
+        let loc = touch.location(in: view)
+        guard let n = normalize?(loc) else { return }
+        let (nx, ny) = (n.x, n.y)
+
+        let pressure = min(Double(touch.force), 1.0)
+        let azimuth = Double(touch.azimuthAngle(in: view))
+        let altitude = Double(touch.altitudeAngle)
+
+        if !ended && !activePens.contains(id) {
+            activePens.insert(id)
+            openProximity(x: nx, y: ny)
+            emitPencil("down", x: nx, y: ny, pressure: pressure,
+                       azimuth: azimuth, altitude: altitude)
+            return
+        }
+
+        if !ended {
+            for c in event?.samples(for: touch) ?? [touch] {
+                guard let cn = normalize?(c.location(in: view)) else { continue }
+                emitPencil("move", x: cn.x, y: cn.y,
+                           pressure: min(Double(c.force), 1.0),
+                           azimuth: Double(c.azimuthAngle(in: view)),
+                           altitude: Double(c.altitudeAngle))
+            }
+            return
+        }
+
+        defer { activePens.remove(id) }
+        emitPencil("up", x: nx, y: ny, pressure: 0,
+                   azimuth: azimuth, altitude: altitude)
+        closeProximity(x: nx, y: ny)
+    }
+
+    private func emitPencil(_ phase: String, x: Double, y: Double,
+                            pressure: Double, azimuth: Double, altitude: Double) {
+        onPencil?(phase, x, y, pressure, azimuth, altitude)
     }
 }

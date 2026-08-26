@@ -62,6 +62,98 @@ pipeline, USB transport, input injection) are already working.
 - 🔒 **Self-hosted & private** — your screen never touches anyone's server.
   Two small apps, one TCP connection, that's it.
 
+## Comparison
+
+| | OpenDisplay | Apple Sidecar | Duet Display | Luna Display |
+|---|---|---|---|---|
+| Price | **Free, open source** | Free | Subscription | $$$ + dongle |
+| iPhone as display | ✅ | ❌ (iPad only) | ✅ | ✅ |
+| Different Apple IDs | ✅ | ❌ | ✅ | ✅ |
+| Wired (USB) | ✅ | ✅ | ✅ | ❌ |
+| True extension | ✅ | ✅ | ✅ | ✅ |
+| Touch input | ✅ | ✅ | ✅ | ✅ |
+| Self-hosted / auditable | ✅ | — | ❌ | ❌ |
+
+## FAQ
+
+**Why do I see the purple screen-recording indicator in the menu bar?**
+That's a macOS privacy indicator shown for *any* app that captures the
+screen — Duet, Luna, OBS, and Zoom trigger it too. Apple Sidecar doesn't,
+only because it's implemented inside the OS rather than on public capture
+APIs. It cannot (and shouldn't) be hidden by an app; it's how macOS tells
+you a capture is running.
+
+**The Mac app doesn't show my iPhone in the Connection menu (WiFi).**
+Both sides need **Local Network** permission, and both fail *silently*
+without it: check Privacy & Security → Local Network on the Mac **and** on
+the iPhone, make sure both are on the same WiFi network, and keep the
+iPhone app open in the foreground. USB mode is unaffected.
+
+**What USB cable or version do I need?** Your cable **must support data** — a
+charge-only USB cable will **not** work. Look for a cable described as a
+*data*, *sync*, or *charging and data-transfer* cable. A data-capable USB 2.0
+cable is enough; USB 3, Thunderbolt, and video Alt Mode are not required.
+OpenDisplay streams H.264 over a TCP connection through macOS's built-in
+`usbmuxd`, not as a USB video device. Its highest-quality preset uses 18 Mb/s,
+well below USB 2.0's 480 Mb/s high-speed link rate, so USB 2.0 has ample
+bandwidth for the stream. USB 1.x is not supported or tested. For best
+reliability, use a known-good data/sync cable, unlock the device, accept the
+**Trust This Computer** prompt if it appears, and avoid unreliable hubs or
+adapters.
+
+**Does it support iPad?** The receiver app is universal (iPhone + iPad);
+iPad is the same codebase. iPad-specific polish (Pencil, pressure) is on the
+roadmap.
+
+**Why H.264 and not HEVC/AV1?** Hardware H.264 encode/decode is universally
+fast and the latency is excellent. HEVC is a planned option for better
+quality-per-bit.
+
+**Is my screen content sent anywhere?** No. One direct TCP connection
+between your Mac and your device, over your cable or your LAN. No servers,
+no accounts, no analytics. Full details — including what the apps store
+locally and the current WiFi-encryption caveat — on the
+[privacy page](https://peetzweg.github.io/opendisplay/privacy.html).
+
+**What's the license? Can I fork it or use it commercially?**
+[GPL-3.0](LICENSE). Use, study, and adapt it freely — commercially too. If
+you distribute a modified version it must stay open source under the same
+license with the original attribution intact, so improvements flow back
+instead of into closed forks. (Releases up to v0.4.x were MIT-licensed and
+remain available under those terms.)
+
+**Will it break on a macOS update?** Possibly — `CGVirtualDisplay` is
+private API. The same risk applies to every virtual-display product.
+The capture/streaming pipeline itself uses only public APIs.
+
+**Audio?** Out of scope for now.
+
+## Compatible apps
+
+The official apps cover a Mac sender and an iPhone/iPad receiver on iOS 16.4+.
+Other people have built their own clients that speak the same protocol, so
+you can also use an Android device or an older iPad as a display, or drive
+one from Linux. The wire protocol is specified in
+[PROTOCOL.md](PROTOCOL.md), so a new client can be written against the spec
+instead of reverse-engineered from the Swift sources. If your hardware is
+not covered yet, start here:
+
+**Android receivers**
+* [gprot42/android-opendisplay](https://github.com/gprot42/android-opendisplay) - GrapheneOS receiver for de-Googled Pixel phones and tablets, Android 8.0+
+* [josepacelli/opendisplay-android](https://github.com/josepacelli/opendisplay-android) - Android receiver, Android 8.0+, works with an unmodified Mac app
+
+**Older iOS receivers**
+* [cuongpham1/ipad-iphone-second-monitor-ios12-free](https://github.com/cuongpham1/ipad-iphone-second-monitor-ios12-free) - iOS 12 client for iPads and iPhones that cannot run the official app
+
+**Linux senders**
+* [tixwho/opendisplay-linux](https://github.com/tixwho/opendisplay-linux) - drive an iPhone or iPad from a Wayland desktop (KDE Plasma, Hyprland)
+
+These are fan-made projects, not official builds. They are not affiliated
+with OpenDisplay and are not maintained, reviewed, or supported by us, so
+please report issues with them in their own repositories. Listing them here
+also says nothing about our own plans: an official OpenDisplay app may still
+ship for any of these platforms later.
+
 ## How it works
 
 ```
@@ -81,6 +173,11 @@ macOS install) and WiFi. The phone
 announces its native panel size; the Mac creates a `CGVirtualDisplay` at
 exactly half that in points (@2x HiDPI) and streams the pixels back.
 
+Everything that crosses the socket — framing, discovery, the video format,
+every control message — is specified in [PROTOCOL.md](PROTOCOL.md). How the
+protocol evolves across releases is covered in
+[COMPATIBILITY.md](COMPATIBILITY.md).
+
 `CGVirtualDisplay` is a **private CoreGraphics API** (the same one used by
 BetterDisplay and DeskPad) — which is precisely why this project can't ship
 on the App Store and lives on GitHub instead.
@@ -99,6 +196,11 @@ opens with a plain double-click on macOS 14+ — no Gatekeeper warning. Open the
 `.dmg` and drag the app to Applications.
 
 ### iPhone app
+
+Needs **iOS / iPadOS 16 or newer** — including the 16.7.x line, which is where
+Apple left the iPad 5 (2017), the iPad Pro 1st gen, the iPhone 8 and the
+iPhone X. If your iPad can't be updated past 16.7, it can still be a second
+display ([#72](https://github.com/peetzweg/opendisplay/issues/72)).
 
 - **TestFlight** (recommended): join the public beta at
   [testflight.apple.com/join/3NYaY11c](https://testflight.apple.com/join/3NYaY11c).
@@ -169,59 +271,20 @@ All live under **Privacy & Security** in System Settings (Mac) / Settings
 without them. If the prompt never appeared, toggle the entry manually or
 force-quit and reopen the app.
 
-## FAQ
+### Getting the logs for a bug report
 
-**Why do I see the purple screen-recording indicator in the menu bar?**
-That's a macOS privacy indicator shown for *any* app that captures the
-screen — Duet, Luna, OBS, and Zoom trigger it too. Apple Sidecar doesn't,
-only because it's implemented inside the OS rather than on public capture
-APIs. It cannot (and shouldn't) be hidden by an app; it's how macOS tells
-you a capture is running.
+Both apps keep a local log of connection events. Nothing is uploaded anywhere;
+the logs only leave a device when you share them.
 
-**The Mac app doesn't show my iPhone in the Connection menu (WiFi).**
-Both sides need **Local Network** permission, and both fail *silently*
-without it: check Privacy & Security → Local Network on the Mac **and** on
-the iPhone, make sure both are on the same WiFi network, and keep the
-iPhone app open in the foreground. USB mode is unaffected.
+- **Mac:** click **Logs** in the app panel. Finder opens with
+  `~/Library/Logs/OpenDisplay` selected.
+- **iPhone/iPad:** shake the device (or tap **Settings & Help** when idle), then
+  open **Connection log**. Share hands the file to Mail, Messages or Files; copy
+  puts the text on the clipboard for pasting straight into an issue.
 
-**Does it support iPad?** The receiver app is universal (iPhone + iPad);
-iPad is the same codebase. iPad-specific polish (Pencil, pressure) is on the
-roadmap.
-
-**Why H.264 and not HEVC/AV1?** Hardware H.264 encode/decode is universally
-fast and the latency is excellent. HEVC is a planned option for better
-quality-per-bit.
-
-**Is my screen content sent anywhere?** No. One direct TCP connection
-between your Mac and your device, over your cable or your LAN. No servers,
-no accounts, no analytics. Full details — including what the apps store
-locally and the current WiFi-encryption caveat — on the
-[privacy page](https://peetzweg.github.io/opendisplay/privacy.html).
-
-**What's the license? Can I fork it or use it commercially?**
-[GPL-3.0](LICENSE). Use, study, and adapt it freely — commercially too. If
-you distribute a modified version it must stay open source under the same
-license with the original attribution intact, so improvements flow back
-instead of into closed forks. (Releases up to v0.4.x were MIT-licensed and
-remain available under those terms.)
-
-**Will it break on a macOS update?** Possibly — `CGVirtualDisplay` is
-private API. The same risk applies to every virtual-display product.
-The capture/streaming pipeline itself uses only public APIs.
-
-**Audio?** Out of scope for now.
-
-## Comparison
-
-| | OpenDisplay | Apple Sidecar | Duet Display | Luna Display |
-|---|---|---|---|---|
-| Price | **Free, open source** | Free | Subscription | $$$ + dongle |
-| iPhone as display | ✅ | ❌ (iPad only) | ✅ | ✅ |
-| Different Apple IDs | ✅ | ❌ | ✅ | ✅ |
-| Wired (USB) | ✅ | ✅ | ✅ | ❌ |
-| True extension | ✅ | ✅ | ✅ | ✅ |
-| Touch input | ✅ | ✅ | ✅ | ✅ |
-| Self-hosted / auditable | ✅ | — | ❌ | ❌ |
+The phone log is the half usually missing from a WiFi report: whether the
+receiver ever announced itself, whether its listener restarted, whether the
+decoder was failing. Attach both if you can.
 
 ## Roadmap
 

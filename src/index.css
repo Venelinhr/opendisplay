@@ -37,6 +37,9 @@ nav .links a:hover { color: var(--fg); }
 nav .links a.gh { display: inline-flex; align-items: center; gap: 6px; }
 nav .gh-logo { width: 16px; height: 16px; fill: currentColor; display: block; }
 nav .gh-stars { font-variant-numeric: tabular-nums; }
+/* Seven links plus the star count outgrow the row well before the 680px
+   cutoff — tighten the spacing instead of dropping an item. */
+@media (max-width: 900px) { nav .links { gap: 14px; font-size: 0.85rem; } }
 @media (max-width: 680px) { nav .links { display: none; } }
 
 /* ---- section scaffolding ---- */
@@ -124,13 +127,13 @@ h2 { font-size: clamp(1.5rem, 3vw, 2rem); line-height: 1.1; letter-spacing: -0.0
 .dl-head { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.1em;
   text-transform: uppercase; color: var(--faint); margin-bottom: 6px;
   display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-.dl-head .step { color: var(--fg); border: 1px solid var(--line-strong); border-radius: 3px;
+.dl-head .step { color: var(--fg); border: 1px solid var(--line-strong);
   padding: 2px 7px; letter-spacing: 0.06em; }
 .dl-head .ver { color: var(--fg); text-transform: none; letter-spacing: 0; }
 .dl-sub { color: var(--muted); font-size: 0.86rem; margin-bottom: 18px; }
 
 .btn { display: inline-flex; align-items: center; gap: 8px; font: inherit;
-  font-weight: 600; font-size: 0.95rem; padding: 12px 22px; border-radius: 3px;
+  font-weight: 600; font-size: 0.95rem; padding: 12px 22px;
   text-decoration: none; border: 1px solid var(--line-strong); cursor: pointer; }
 .btn.primary { background: var(--fg); color: var(--bg); }
 .btn.primary:hover { background: #000; }
@@ -164,36 +167,47 @@ h2 { font-size: clamp(1.5rem, 3vw, 2rem); line-height: 1.1; letter-spacing: -0.0
 .showcase-track::-webkit-scrollbar { display: none; }
 .showcase-item { flex: 0 0 auto; scroll-snap-align: start; }
 .showcase-item.is-video { width: min(84vw, 640px); }
-.showcase-item.is-post { width: min(84vw, 400px); }
-/* Post cards: self-contained, self-hosted renditions of community posts.
-   The whole card is one link to the post on X. */
-a.showcase-item.is-post { display: block; border: 1px solid var(--line);
-  border-radius: 12px; padding: 18px 20px; text-decoration: none;
-  color: var(--fg); background: var(--bg); }
-a.showcase-item.is-post:hover { border-color: var(--line-strong); }
-.post-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.post-avatar { width: 44px; height: 44px; border-radius: 50%; display: block; }
-.post-who { display: flex; flex-direction: column; line-height: 1.3; min-width: 0; }
-.post-author { font-weight: 600; font-size: 0.95rem; }
-.post-handle { color: var(--muted); font-size: 0.86rem; }
-.post-x { width: 18px; height: 18px; fill: var(--faint); margin-left: auto; flex: none; }
-.showcase-item.is-post:hover .post-x { fill: var(--fg); }
-.post-text { font-size: 0.95rem; margin: 0; }
-.post-text + .post-text { margin-top: 0.5em; }
-.post-trans { font-size: 0.9rem; line-height: 1.45; margin: 12px 0 0;
-  color: var(--muted); font-style: italic; }
-.post-trans + .post-trans { margin-top: 0.5em; }
-.post-photo { display: block; width: 100%; height: auto; border-radius: 8px;
-  margin: 14px 0 12px; border: 1px solid var(--line); }
-.post-date { font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.04em;
-  color: var(--faint); }
-.showcase-item.is-post:hover .post-date { color: var(--muted); }
+.showcase-item.is-coverage { width: min(84vw, 350px); }
+/* External links use their publication's own Open Graph title, description,
+   and image when available. This is intentionally a generic preview rather
+   than a fragile recreation of an article or X post. */
+a.showcase-item.is-coverage { display: flex; min-height: 312px; flex-direction: column;
+  border: 1px solid var(--line); text-decoration: none; color: var(--fg); background: var(--bg); }
+a.showcase-item.is-coverage:hover { border-color: var(--line-strong); }
+.coverage-image, .coverage-placeholder { display: block; width: 100%; height: 150px; object-fit: cover;
+  border-bottom: 1px solid var(--line); }
+.coverage-placeholder { background: linear-gradient(135deg, #eef7ff, #d7edff 48%, #f8fbfd); }
+.coverage-body { display: flex; flex: 1; flex-direction: column; padding: 18px 20px; }
+.coverage-site { display: flex; align-items: center; gap: 6px; color: var(--faint); font-family: var(--mono);
+  font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase; }
+.coverage-external { width: 13px; height: 13px; fill: currentColor; }
+.coverage-body h3 { font-size: 1rem; line-height: 1.28; letter-spacing: -0.01em; margin-top: 10px; }
+.coverage-body p { color: var(--muted); font-size: 0.86rem; line-height: 1.45; margin-top: 8px; }
+.coverage-cta { color: var(--muted); font-family: var(--mono); font-size: 0.72rem;
+  letter-spacing: 0.04em; margin-top: auto; padding-top: 16px; }
+a.showcase-item.is-coverage:hover .coverage-cta { color: var(--fg); }
+/* X posts use the public oEmbed copy at curation time. Keeping the original
+   language (and a contained excerpt) makes each recommendation recognisable
+   without pulling X's widget or trying to recreate its full interface. */
+a.showcase-item.is-post { min-height: 0; padding: 18px 20px 0; }
+.post-head { display: flex; align-items: center; gap: 10px; }
+.post-monogram { display: grid; flex: none; place-items: center; width: 38px; height: 38px;
+  border-radius: 50%; background: var(--accent); color: #fff; font-size: 0.95rem; font-weight: 700; }
+.post-head > div { display: flex; min-width: 0; flex-direction: column; line-height: 1.25; }
+.post-head strong { font-size: 0.9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.post-head span:not(.post-monogram):not(.post-x) { color: var(--muted); font-size: 0.8rem; }
+.post-x { margin-left: auto; color: var(--faint); font-size: 1.1rem; }
+.post-quote { display: -webkit-box; margin-top: 16px; overflow: hidden; color: var(--fg);
+  font-size: 0.93rem; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 6; }
+.post-date { margin-top: 12px; color: var(--faint); font-family: var(--mono); font-size: 0.7rem;
+  letter-spacing: 0.04em; }
+a.showcase-item.is-post .coverage-body { min-height: 52px; padding: 0; }
 .showcase-nav { display: flex; gap: 10px; margin-top: 16px; justify-content: flex-end;
   padding-inline: var(--bleed-pad); }
 .showcase-nav button { font-family: var(--mono); font-size: 1rem; line-height: 1;
   width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center;
   background: transparent; color: var(--fg); border: 1px solid var(--line-strong);
-  border-radius: 3px; cursor: pointer; }
+  cursor: pointer; }
 .showcase-nav button:hover:not(:disabled) { background: var(--fg); color: var(--bg); }
 .showcase-nav button:disabled { color: var(--faint); border-color: var(--line); cursor: default; }
 
@@ -227,17 +241,17 @@ a.showcase-item.is-post:hover { border-color: var(--line-strong); }
   padding: 22px 24px; border-bottom: 1px solid var(--line); align-items: start; }
 .compare .row p { color: var(--muted); max-width: 80ch; }
 .compare .row .name { font-weight: 600; color: var(--fg); }
-.compare .row.highlight { border: 2px solid var(--accent); border-radius: 4px;
+.compare .row.highlight { border: 2px solid var(--accent);
   background: #fafafa; padding: 22px; margin-top: 10px; }
 @media (max-width: 560px) { .compare .row { grid-template-columns: 1fr; gap: 6px; } }
 .tbl-head { margin: 48px 0 16px; font-size: 1.05rem; font-weight: 600; letter-spacing: -0.01em; }
 
 /* ---- code ---- */
-pre { border: 1px solid var(--line); border-radius: 3px; padding: 20px;
+pre { border: 1px solid var(--line); padding: 20px;
   overflow-x: auto; font-size: 0.84rem; line-height: 1.55; background: #fafafa;
   margin-top: 8px; }
 code { font-family: var(--mono); }
-p code { font-size: 0.88em; background: #f2f2f2; padding: 1px 5px; border-radius: 3px; }
+p code { font-size: 0.88em; background: #f2f2f2; padding: 1px 5px; }
 
 /* ---- comparison table ---- */
 /* no outer frame — keep only the inner row lines (and the boxed OpenDisplay column) */
@@ -269,6 +283,29 @@ summary::after { content: "+"; font-family: var(--mono); color: var(--faint);
 details[open] summary::after { content: "–"; }
 details p { color: var(--muted); padding: 0 0 24px; max-width: 78ch; }
 
+/* ---- compatible apps ---- */
+/* Same hairline-cell grid as .fgrid, but every cell is a link to a community
+   repo: mono role label on top, repo path as the heading. */
+.compat-lead { color: var(--muted); max-width: 78ch; margin-top: 8px; }
+.compat { display: grid; grid-template-columns: repeat(2, 1fr);
+  border-top: 1px solid var(--line); border-left: 1px solid var(--line);
+  margin-top: 32px; }
+a.compat-item { display: block; padding: 24px; text-decoration: none; color: var(--fg);
+  border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+a.compat-item:hover { background: #fafafa; }
+.compat-role { font-family: var(--mono); font-size: 0.78rem; color: var(--faint);
+  display: block; margin-bottom: 12px; }
+/* Repo paths are long (one runs to 45 chars) — allow a mid-path break so a
+   narrow cell wraps instead of overflowing. */
+.compat-repo { display: block; font-weight: 600; font-size: 1.02rem;
+  letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.compat-item p { color: var(--muted); font-size: 0.92rem; margin-top: 6px; }
+.compat-note { color: var(--muted); font-size: 0.9rem; max-width: 78ch; margin-top: 28px; }
+@media (max-width: 560px) {
+  .compat { grid-template-columns: 1fr; }
+  a.compat-item { padding: 20px; }
+}
+
 /* ---- support / ko-fi ---- */
 .support { text-align: center; }
 .support h2 { max-width: 22ch; margin: 0 auto; }
@@ -293,9 +330,13 @@ details p { color: var(--muted); padding: 0 0 24px; max-width: 78ch; }
 .support-nudge { position: sticky; top: 60px; z-index: 9;
   display: flex; width: fit-content; margin: 0 auto;
   align-items: center; gap: 14px; padding: 10px 18px;
-  border: 1px solid var(--line); border-radius: 3px;
+  border: 1px solid var(--line);
   background: var(--bg); text-decoration: none; color: var(--fg); }
 .support-nudge:hover { background: #fafafa; }
+/* Pinned under the nav: drop the top border so it doesn't double up against the
+   nav's bottom rule. Border stays 1px but transparent — no layout shift, and
+   the nav's opaque border paints over that row anyway. */
+.support-nudge.is-stuck { border-top-color: transparent; }
 .kofi-banner-left { display: inline-flex; align-items: center; gap: 10px; min-width: 0; }
 .support-nudge .kofi-mark { height: 24px; width: auto; display: block; flex: none; }
 .kofi-banner-text { font-size: 0.9rem; color: var(--muted); }
@@ -304,10 +345,9 @@ details p { color: var(--muted); padding: 0 0 24px; max-width: 78ch; }
   transition: transform 0.15s ease; }
 .support-nudge:hover .kofi-banner-arrow { transform: translateY(3px); }
 @media (max-width: 560px) {
-  /* Full-width band: drop the side borders (and now-orphaned corner radius) so
-     only the top/bottom rules remain. */
+  /* Full-width band: drop the side borders so only the top/bottom rules remain. */
   .support-nudge { width: auto; flex-direction: column; gap: 6px; text-align: center;
-    border-left: 0; border-right: 0; border-radius: 0; }
+    border-left: 0; border-right: 0; }
 }
 
 /* ---- footer ---- */
