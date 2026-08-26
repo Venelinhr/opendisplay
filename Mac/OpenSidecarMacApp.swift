@@ -173,7 +173,11 @@ final class DeviceSession: ObservableObject, Identifiable {
     // and its service row.
     var wifiServiceName: String?
 
-    var transportLabel: String { onUSB ? "USB" : "WiFi" }
+    // The live TCP path runs over a cable (Thunderbolt Bridge / Ethernet)
+    // rather than WiFi — reported by the sender once connected.
+    @Published var wired = false
+
+    var transportLabel: String { onUSB ? "USB" : wired ? "Cable" : "WiFi" }
 
     init(id: String, target: ConnectionTarget, name: String, sender: MacSender) {
         self.id = id
@@ -656,6 +660,9 @@ final class SenderController: ObservableObject {
             UserDefaults.standard.set(Int(totalOffset), forKey: Self.identityOffsetKey(for: session.id))
             Log.info("display identity for \(session.id) moved to offset \(totalOffset) — "
                 + "macOS saved hostile state for the old one")
+        }
+        sender.onTransportPath = { [weak session] wired in
+            session?.wired = wired
         }
         sender.onPeerClosed = { [weak self, weak session] in
             // The receiver app quit — a deliberate goodbye, so no reconnect
