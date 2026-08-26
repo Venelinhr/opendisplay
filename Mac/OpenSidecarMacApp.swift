@@ -72,6 +72,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // Quitting while being a display: tell the sender we're closing (it ends
+    // the session instead of retrying a dead peer) before the process goes.
+    // stop() calls back once the message is out or a second has passed.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard ReceiverController.shared.active else { return .terminateNow }
+        ReceiverController.shared.stop {
+            DispatchQueue.main.async { NSApp.reply(toApplicationShouldTerminate: true) }
+        }
+        return .terminateLater
+    }
+
     // Background/Dock modes: opening the app again (Spotlight, Finder, Dock
     // click) brings up the control window — Hammerspoon-style.
     func applicationShouldHandleReopen(_ sender: NSApplication,

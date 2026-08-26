@@ -11,6 +11,7 @@
 import AppKit
 import AVFoundation
 import Combine
+import IOKit.pwr_mgt
 import SwiftUI
 
 @MainActor
@@ -32,6 +33,7 @@ final class ReceiverController: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var sleepActivity: NSObjectProtocol?
     private var screenObserver: NSObjectProtocol?
+    private var screenSleepObservers: [NSObjectProtocol] = []
 
     private var fallbackName: String { Host.current().localizedName ?? "Mac" }
 
@@ -51,7 +53,6 @@ final class ReceiverController: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] connected in
                 self?.connected = connected
-                self?.updateSleepAssertion(connected)
             }
             .store(in: &cancellables)
         // Streaming = connected and the video format is known — that's when
@@ -62,9 +63,29 @@ final class ReceiverController: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] streaming in
                 self?.streaming = streaming
+                self?.updateSleepAssertion(streaming)
                 if streaming { self?.showWindow() } else { self?.closeWindow() }
             }
             .store(in: &cancellables)
+
+        // The receiving Mac's own panel went dark (idle sleep, lid) — nobody
+        // can see the stream, so tell the sender exactly like a locked
+        // iPhone does; it drops its display and arms a reconnect. On wake
+        // the listener comes back and the sender redials.
+        let workspace = NSWorkspace.shared.notificationCenter
+        screenSleepObservers = [
+            workspace.addObserver(forName: NSWorkspace.screensDidSleepNotification,
+                                  object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    Log.info("screens slept — announcing sleeping to the sender")
+                    self?.receiver?.enterSleep()
+                }
+            },
+            workspace.addObserver(forName: NSWorkspace.screensDidWakeNotification,
+                                  object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.receiver?.ensureListening() }
+            },
+        ]
 
         // Display-mode changes move the goalposts mid-session (the announced
         // panel is the sender's virtual-display size) — re-announce, the
@@ -80,12 +101,18 @@ final class ReceiverController: ObservableObject {
         Log.info("receiver mode started (advertising \"\(receiver.serviceName)\")")
     }
 
-    func stop() {
-        guard let receiver else { return }
+    /// Leave receiver mode. `completion` fires once "closing" has gone out
+    /// to a live sender (or a second has passed) — the quit path waits on it
+    /// so the sender ends its session instead of retrying a dead peer.
+    func stop(completion: (() -> Void)? = nil) {
+        guard let receiver else { completion?(); return }
         cancellables.removeAll()
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
         screenObserver = nil
-        receiver.stop()
+        let workspace = NSWorkspace.shared.notificationCenter
+        screenSleepObservers.forEach { workspace.removeObserver($0) }
+        screenSleepObservers = []
+        receiver.stop(completion: completion)
         self.receiver = nil
         connected = false
         streaming = false
@@ -111,10 +138,22 @@ final class ReceiverController: ObservableObject {
     /// full panel would letterbox full screen on every side AND render the
     /// remote menu bar physically behind the notch; announcing the safe
     /// rect makes full screen exactly 1:1.
+    ///
+    /// Non-Retina panels (scale 1, the legacy-Mac case): the sender always
+    /// builds an @2x HiDPI display of half the announced pixels, so
+    /// announcing the raw framebuffer would give a display with half the
+    /// points and comically large UI. Announce the panel's *point* size at
+    /// 2x instead: the sender's display then has the same point geometry as
+    /// the panel and the receiver scales the stream down 2:1 on the way in.
+    /// Costs encode bandwidth (the quality presets scale capture down
+    /// anyway), buys a correct-looking desktop.
     private func announcePanel(to receiver: StreamReceiver) {
         guard let screen = NSScreen.screens.first else { return }
-        let scale = screen.backingScaleFactor
+        let scale = max(screen.backingScaleFactor, 2)
         let height = screen.frame.height - screen.safeAreaInsets.top
+        if screen.backingScaleFactor < 2 {
+            Log.info("non-Retina panel (\(screen.backingScaleFactor)x) — announcing points at 2x")
+        }
         receiver.setPanel(pixelsWide: Int(screen.frame.width * scale),
                           pixelsHigh: Int(height * scale),
                           scale: Double(scale))
@@ -163,9 +202,18 @@ final class ReceiverController: ObservableObject {
 
     // MARK: - Stay awake
 
-    /// This Mac *is* the display while a sender streams — never let it doze.
+    /// This Mac *is* the display while a sender streams — never let it doze,
+    /// and wake it up when the stream starts. beginActivity only prevents
+    /// *future* idle sleep; a spare Mac with no keyboard has usually gone
+    /// dark by the time a sender connects, and frames into a black panel
+    /// looked like nothing worked at all. Declaring user activity is what
+    /// actually lights the display again.
     private func updateSleepAssertion(_ receiving: Bool) {
         if receiving, sleepActivity == nil {
+            var assertionID = IOPMAssertionID(0)
+            IOPMAssertionDeclareUserActivity(
+                "OpenDisplay stream started" as CFString,
+                kIOPMUserActiveLocal, &assertionID)
             sleepActivity = ProcessInfo.processInfo.beginActivity(
                 options: [.idleDisplaySleepDisabled, .idleSystemSleepDisabled],
                 reason: "OpenDisplay is receiving a display stream")
@@ -233,6 +281,12 @@ final class ReceiverVideoView: NSView {
 
         // The shared perf HUD (same as iOS), toggled by "showAnalytics".
         let overlay = OverlayHostingView(rootView: ReceiverPerfOverlay(receiver: receiver))
+        // An NSHostingView reports its SwiftUI content's intrinsic size to
+        // Auto Layout by default; pinned edge-to-edge with required
+        // constraints that size drives the *window*, which collapsed to
+        // 0 × titlebar with the HUD hidden (and to the HUD's size with it
+        // shown). No intrinsic metric: the window keeps the size it was made.
+        overlay.sizingOptions = []
         overlay.translatesAutoresizingMaskIntoConstraints = false
         addSubview(overlay)
         NSLayoutConstraint.activate([

@@ -90,7 +90,10 @@ final class StreamReceiver: ObservableObject {
     // so the listener can accept a fresh one.
     private var lastDataReceived = Date()
     private var port: UInt16 = 9000
-    private var monitorsStarted = false
+    // Liveness monitors: cancel-and-replace timers (not self-rescheduling
+    // asyncAfter chains) so stop() can actually silence them — see #75.
+    private var pingTimer: DispatchSourceTimer?
+    private var watchdogTimer: DispatchSourceTimer?
 
     private var framesThisWindow = 0
     private var fpsWindowStart = Date()
@@ -263,27 +266,24 @@ final class StreamReceiver: ObservableObject {
 
     func start(port: UInt16 = 9000) {
         self.port = port
-        queue.async { self.startListener() }
-        if !monitorsStarted {
-            monitorsStarted = true
-            schedulePing()
-            scheduleWatchdog()
+        queue.async {
+            self.startListener()
+            self.armLivenessTimers()
         }
     }
 
-    /// Stop listening and drop any live connection — the Mac app calls this
-    /// when the user leaves receiver mode. The liveness monitors stay armed
-    /// but idle; the instance can be restarted with start() or discarded.
-    func stop() {
+    /// Leave receiver duty for good: announce "closing" to a live sender (so
+    /// it ends the session instead of waiting for a wake), drop the
+    /// connection and the listener, and silence the liveness timers. The Mac
+    /// app calls this when the user leaves receiver mode or quits; the
+    /// instance is discarded afterwards (start() re-arms if it isn't).
+    func stop(completion: (() -> Void)? = nil) {
         queue.async {
-            self.listener?.cancel()
-            self.listener = nil
-            self.listenerHealthy = false
-            self.connection?.cancel()
-            self.connection = nil
-            self.setConnected(false)
-            self.setStatus("Stopped")
+            self.pingTimer?.cancel(); self.pingTimer = nil
+            self.watchdogTimer?.cancel(); self.watchdogTimer = nil
         }
+        closeSession(announcing: WireMessage.closing, status: "Stopped",
+                     completion: completion)
     }
 
     /// Recreate the listener if it isn't healthy — called when the app
@@ -442,14 +442,31 @@ final class StreamReceiver: ObservableObject {
 
     // MARK: - Liveness (ping + watchdog)
 
-    private func schedulePing() {
-        queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            guard let self else { return }
-            if self.connection?.state == .ready {
-                self.sendControl(["type": "ping", "t": self.nowMs])
-            }
-            self.schedulePing()
+    /// Arm (or re-arm) the ping and watchdog timers on the receiver queue.
+    private func armLivenessTimers() {
+        pingTimer?.cancel()
+        let ping = DispatchSource.makeTimerSource(queue: queue)
+        ping.schedule(deadline: .now() + 2.0, repeating: 2.0)
+        ping.setEventHandler { [weak self] in
+            guard let self, self.connection?.state == .ready else { return }
+            self.sendControl(["type": "ping", "t": self.nowMs])
         }
+        ping.resume()
+        pingTimer = ping
+
+        watchdogTimer?.cancel()
+        let watchdog = DispatchSource.makeTimerSource(queue: queue)
+        watchdog.schedule(deadline: .now() + 2.0, repeating: 2.0)
+        watchdog.setEventHandler { [weak self] in
+            guard let self, let conn = self.connection, conn.state == .ready,
+                  Date().timeIntervalSince(self.lastDataReceived) > 5 else { return }
+            Log.info("watchdog: nothing from the Mac for >5s — dropping connection")
+            conn.cancel()
+            self.connection = nil
+            self.setConnected(false)
+        }
+        watchdog.resume()
+        watchdogTimer = watchdog
     }
 
     /// JSON on the video channel (pong, ping liveness) — payloads starting '{'.
@@ -524,20 +541,6 @@ final class StreamReceiver: ObservableObject {
             DispatchQueue.main.async { self.peerSignal = .updateReceiver(message: message, storeURL: store) }
         default:
             break
-        }
-    }
-
-    private func scheduleWatchdog() {
-        queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            guard let self else { return }
-            if let conn = self.connection, conn.state == .ready,
-               Date().timeIntervalSince(self.lastDataReceived) > 5 {
-                Log.info("watchdog: nothing from the Mac for >5s — dropping connection")
-                conn.cancel()
-                self.connection = nil
-                self.setConnected(false)
-            }
-            self.scheduleWatchdog()
         }
     }
 
