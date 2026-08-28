@@ -281,15 +281,15 @@ final class ReceiverVideoView: NSView {
             .sink { [weak self] _ in self?.needsLayout = true }
 
         // The shared perf HUD (same as iOS), toggled by "showAnalytics".
+        // Sized with autoresizing, not Auto Layout: an NSHostingView reports
+        // its SwiftUI content's intrinsic size, and pinned edge-to-edge with
+        // required constraints that size drove the *window*, which collapsed
+        // to 0 × titlebar with the HUD hidden. Springs and struts never feed
+        // back into the window, on any macOS the app supports.
         let overlay = OverlayHostingView(rootView: ReceiverPerfOverlay(receiver: receiver))
-        overlay.translatesAutoresizingMaskIntoConstraints = false
+        overlay.frame = bounds
+        overlay.autoresizingMask = [.width, .height]
         addSubview(overlay)
-        NSLayoutConstraint.activate([
-            overlay.topAnchor.constraint(equalTo: topAnchor),
-            overlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-            overlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            overlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-        ])
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
@@ -389,16 +389,6 @@ struct ReceiverPerfOverlay: View {
 /// Full-bleed, non-interactive layer above the video. Subclassed only so the
 /// blank-cursor rect covers the HUD area too.
 private final class OverlayHostingView: NSHostingView<ReceiverPerfOverlay> {
-    // An NSHostingView reports its SwiftUI content's intrinsic size to Auto
-    // Layout by default; pinned edge-to-edge with required constraints that
-    // size drives the *window*, which collapsed to 0 × titlebar with the HUD
-    // hidden (and to the HUD's size with it shown). No intrinsic metric: the
-    // window keeps the size it was made. (Overriding rather than
-    // `sizingOptions = []` so it also holds on macOS 12.)
-    override var intrinsicContentSize: NSSize {
-        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
-    }
-
     required init(rootView: ReceiverPerfOverlay) {
         super.init(rootView: rootView)
     }
