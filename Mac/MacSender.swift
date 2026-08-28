@@ -876,14 +876,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // manual reconnect) superseded it. Only touched on `queue`.
     private var dialGeneration = 0
 
-    // Cable first. A Mac receiver cabled with a Thunderbolt/USB4 lead shows
-    // up on the Thunderbolt Bridge interface *and* on WiFi under the same
-    // Bonjour name; left alone, the resolver usually picks WiFi. Every dial
-    // sequence therefore first forbids WiFi. With no wired path the
-    // connection reports .waiting at once (no viable route), and we redial
-    // unconstrained — the cable-less case pays nothing noticeable.
-    private var wiredOnlyFailed = false
-
     private func connect() {
         guard !stopped else { return }
         switch transport {
@@ -926,23 +918,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func connectTCP(_ endpoint: NWEndpoint) {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
+        // No interface steering: macOS already ranks a Thunderbolt Bridge or
+        // Ethernet link above WiFi, so a plain dial lands on the cable when
+        // there is one (field-tested: en10 chosen over en0). A WiFi-prohibited
+        // pre-dial was tried and only ever hung until its timeout, adding 2s
+        // to every connect. becomeReady reports which path won.
         let params = NWParameters(tls: nil, tcp: options)
-        let wiredOnly = !wiredOnlyFailed
-        if wiredOnly {
-            params.prohibitedInterfaceTypes = [.wifi, .cellular]
-        }
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
-        // Wired-only dial that can't get there: fall back to any path, now.
-        let fallBackToAnyPath: () -> Void = { [weak self] in
-            guard let self, self.connection === conn, !self.stopped else { return }
-            Log.info("no wired path to \(self.endpointName) — dialing over any interface")
-            self.wiredOnlyFailed = true
-            self.dialGeneration += 1
-            conn.cancel()
-            self.connection = nil
-            self.connect()
-        }
         // A dial to a withdrawn Bonjour service (receiver asleep or app
         // closed) sits in .preparing forever — it neither fails nor resolves
         // when the service later returns, observed on macOS 26. Give every
@@ -950,10 +933,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // Bonjour resolution, so the retry loop reaches the receiver the
         // moment it advertises again.
         let generation = dialGeneration
-        queue.asyncAfter(deadline: .now() + (wiredOnly ? 2.0 : 5.0)) { [weak self] in
+        queue.asyncAfter(deadline: .now() + 5.0) { [weak self] in
             guard let self, generation == self.dialGeneration, !self.stopped,
                   self.connection === conn, conn.state != .ready else { return }
-            if wiredOnly { fallBackToAnyPath(); return }
             Log.info("dial timed out in \(conn.state) — redialing")
             self.scheduleReconnect()
         }
@@ -962,8 +944,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             switch state {
             case .ready:
                 self.becomeReady(conn)
-            case .failed where wiredOnly, .waiting where wiredOnly:
-                fallBackToAnyPath()
             case .failed(let error):
                 Log.info("connection failed: \(error)")
                 self.connectionReady = false
@@ -1062,7 +1042,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
         connectionReady = false
-        wiredOnlyFailed = false   // a cable plugged since gets its chance
         dialGeneration += 1   // a USB dial still in flight must not adopt
         let generation = dialGeneration
         connection?.cancel()

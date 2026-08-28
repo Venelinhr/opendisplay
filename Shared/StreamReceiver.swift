@@ -38,6 +38,8 @@ struct PerfStats: Equatable {
     var rttMs = 0.0              // control-channel round trip
     var e2eSamples: [Double] = []  // last ~120 per-frame e2e latencies, ms
     var transport = "—"          // USB (loopback via usbmux) or WiFi
+    var cursorPerSec = 0         // cursor position updates applied (this window)
+    var cursorLost = 0           // UDP cursor datagrams missing or reordered (this window)
     var macDrops = 0             // enc + net drops (legacy total)
     var macEncDrops = 0          // Mac skipped capture: encoder busy
     var macNetDrops = 0          // Mac skipped capture: TCP queue full
@@ -89,6 +91,12 @@ final class StreamReceiver: ObservableObject {
     private var cursorConnection: NWConnection?
     private var cursorPortAnnounced = false
     private var lastCursorSeq: UInt64 = 0
+    // Cursor channel health for the HUD/stats: how many positions landed and
+    // how many datagrams never did (sequence gaps + reordered drops). A
+    // stuttering pointer with a healthy count means the drawing side; a low
+    // count or high loss means the network.
+    private var cursorUpdatesThisWindow = 0
+    private var cursorLostThisWindow = 0
     private var cursorPort: UInt16 { port &+ 1 }
     private let queue = DispatchQueue(label: "receiver.video")
     private var buffer = Data()
@@ -474,9 +482,10 @@ final class StreamReceiver: ObservableObject {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               obj["type"] as? String == "cursor",
               let seq = (obj["s"] as? NSNumber)?.uint64Value else { return }
-        guard seq > lastCursorSeq else { return }
+        guard seq > lastCursorSeq else { cursorLostThisWindow += 1; return }
         // One line per flow so a field log shows the side channel is live.
         if lastCursorSeq == 0 { Log.info("cursor channel: receiving datagrams") }
+        if lastCursorSeq != 0 { cursorLostThisWindow += Int(seq - lastCursorSeq - 1) }
         lastCursorSeq = seq
         applyCursor(obj)
     }
@@ -651,6 +660,7 @@ final class StreamReceiver: ObservableObject {
         let visible = (obj["v"] as? Int ?? 0) == 1
         let x = obj["x"] as? Double ?? 0
         let y = obj["y"] as? Double ?? 0
+        cursorUpdatesThisWindow += 1
         DispatchQueue.main.async {
             self.cursorState = (x, y, visible)
             self.onCursor?(x, y, visible)
@@ -994,6 +1004,8 @@ final class StreamReceiver: ObservableObject {
                 stats.maxFrameMs = frameIntervals.max() ?? 0
             }
             stats.stalls = stallsThisWindow
+            stats.cursorPerSec = Int(Double(cursorUpdatesThisWindow) / elapsed)
+            stats.cursorLost = cursorLostThisWindow
             stats.decodeFlushes = decodeFlushes
             stats.e2eP50 = percentile(e2eWindow, 0.5)
             stats.e2eP95 = percentile(e2eWindow, 0.95)
@@ -1014,6 +1026,8 @@ final class StreamReceiver: ObservableObject {
             framesThisWindow = 0
             bytesThisWindow = 0
             stallsThisWindow = 0
+            cursorUpdatesThisWindow = 0
+            cursorLostThisWindow = 0
             fpsWindowStart = now
 
             // Every 5s, report the aggregate to the Mac so its log holds the
@@ -1031,6 +1045,8 @@ final class StreamReceiver: ObservableObject {
                     "enc50": stats.encodeP50.rounded(),
                     "rtt": lastRttMs.rounded(),
                     "stalls": stats.stalls,
+                    "cur": stats.cursorPerSec,
+                    "curLost": stats.cursorLost,
                     "inp50": macInputP50.rounded(),
                     "capFps": macCapFps,
                     "dec50": stats.decodeP50.rounded(),

@@ -52,6 +52,10 @@ struct PerfOverlay: View {
                 }
                 metric("Mbit/s", String(format: "%.1f", stats.mbps))
                 metric("stalls", "\(stats.stalls)")
+                metric("cursor/s", "\(stats.cursorPerSec)")
+                if stats.cursorLost > 0 {
+                    metric("cursor lost", "\(stats.cursorLost)")
+                }
                 metric("enc↓", "\(stats.macEncDrops)")
                 metric("net↓", "\(stats.macNetDrops)")
                 if stats.macPending > 0 {
