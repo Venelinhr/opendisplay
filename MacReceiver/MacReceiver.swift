@@ -1,9 +1,10 @@
-// Receiver mode (issues #82/#17): this Mac listens exactly like the iPhone
+// The receiver (issues #82/#17): this Mac listens exactly like the iPhone
 // does — Bonjour-advertised TCP listener, hello with its own panel size — and
 // renders the incoming stream, so a spare Mac becomes a display for another
 // Mac. The pipeline is the shared StreamReceiver core; this file is only the
 // AppKit shell around it: lifecycle, the video window, cursor drawing, and
-// keeping the machine awake while it serves as a screen.
+// keeping the machine awake while it serves as a screen. It ships as its own
+// app (OpenSidecarMacReceiver target, macOS 12+) so old Macs can be displays.
 //
 // Display-only for now: the receiving Mac's keyboard/trackpad are not
 // forwarded to the sender (KVM-style input is a follow-up).
@@ -281,12 +282,6 @@ final class ReceiverVideoView: NSView {
 
         // The shared perf HUD (same as iOS), toggled by "showAnalytics".
         let overlay = OverlayHostingView(rootView: ReceiverPerfOverlay(receiver: receiver))
-        // An NSHostingView reports its SwiftUI content's intrinsic size to
-        // Auto Layout by default; pinned edge-to-edge with required
-        // constraints that size drives the *window*, which collapsed to
-        // 0 × titlebar with the HUD hidden (and to the HUD's size with it
-        // shown). No intrinsic metric: the window keeps the size it was made.
-        overlay.sizingOptions = []
         overlay.translatesAutoresizingMaskIntoConstraints = false
         addSubview(overlay)
         NSLayoutConstraint.activate([
@@ -394,6 +389,16 @@ struct ReceiverPerfOverlay: View {
 /// Full-bleed, non-interactive layer above the video. Subclassed only so the
 /// blank-cursor rect covers the HUD area too.
 private final class OverlayHostingView: NSHostingView<ReceiverPerfOverlay> {
+    // An NSHostingView reports its SwiftUI content's intrinsic size to Auto
+    // Layout by default; pinned edge-to-edge with required constraints that
+    // size drives the *window*, which collapsed to 0 × titlebar with the HUD
+    // hidden (and to the HUD's size with it shown). No intrinsic metric: the
+    // window keeps the size it was made. (Overriding rather than
+    // `sizingOptions = []` so it also holds on macOS 12.)
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
+
     required init(rootView: ReceiverPerfOverlay) {
         super.init(rootView: rootView)
     }

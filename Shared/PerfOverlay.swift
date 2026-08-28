@@ -15,7 +15,7 @@ struct PerfOverlay: View {
         VStack(spacing: 8) {
             // Metrics wrap onto extra rows when the width doesn't fit —
             // portrait iPhone is ~390pt, far less than one full row.
-            FlowLayout(hSpacing: 14, vSpacing: 8) {
+            MetricsRow {
                 // Transport badge — the question "is this cable or WiFi?"
                 Text(stats.transport)
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
@@ -64,9 +64,13 @@ struct PerfOverlay: View {
             }
             // Two graphs side by side where they fit (landscape), stacked
             // where they don't (portrait).
-            ViewThatFits(in: .horizontal) {
+            if #available(iOS 16, macOS 13, *) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 14) { graphs }
+                    VStack(spacing: 8) { graphs }
+                }
+            } else {
                 HStack(spacing: 14) { graphs }
-                VStack(spacing: 8) { graphs }
             }
         }
         .padding(.horizontal, 16)
@@ -108,7 +112,22 @@ struct PerfOverlay: View {
 
 /// Left-aligned wrapping row: children flow onto as many rows as the
 /// proposed width requires. Keeps the perf overlay inside the screen in
-/// portrait instead of clipping off both edges.
+/// portrait instead of clipping off both edges. `Layout` needs macOS 13;
+/// the Mac receiver app runs down to macOS 12, where a plain HStack is
+/// fine because a Mac window is never that narrow.
+struct MetricsRow<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        if #available(iOS 16, macOS 13, *) {
+            FlowLayout(hSpacing: 14, vSpacing: 8) { content() }
+        } else {
+            HStack(spacing: 14) { content() }
+        }
+    }
+}
+
+@available(iOS 16, macOS 13, *)
 struct FlowLayout: Layout {
     var hSpacing: CGFloat = 14
     var vSpacing: CGFloat = 8

@@ -6,7 +6,7 @@
 
 **Turn your spare Apple devices into second monitors for your Mac — free, open source, no subscription.**
 
-iPhone and iPad today, spare MacBooks on the roadmap. A self-hosted
+iPhone, iPad, and spare Macs. A self-hosted
 alternative to Apple Sidecar, Duet Display, and Luna Display: true extended
 display (not just mirroring), Retina-sharp, over USB or WiFi, with touch and
 scroll input.
@@ -59,9 +59,9 @@ pipeline, USB transport, input injection) are already working.
 - ⚡ **Low-latency pipeline** — hardware H.264 encode (VideoToolbox,
   real-time mode, no B-frames), TCP_NODELAY, frame-drop backpressure with
   keyframe recovery, decode-and-render via `AVSampleBufferDisplayLayer`.
-- 💻 **A spare Mac as a display** — switch the Mac app to *Be a Display*
-  and any other Mac extends onto it over WiFi or a Thunderbolt/Ethernet
-  cable, at native Retina resolution.
+- 💻 **A spare Mac as a display** — install the small *OpenDisplay
+  Receiver* app (macOS 12+) on an old Mac and any other Mac extends onto it
+  over WiFi or a Thunderbolt/Ethernet cable, at native Retina resolution.
 - 🔒 **Self-hosted & private** — your screen never touches anyone's server.
   Two small apps, one TCP connection, that's it.
 
@@ -108,10 +108,11 @@ adapters.
 iPad is the same codebase. iPad-specific polish (Pencil, pressure) is on the
 roadmap.
 
-**Can another Mac be the display?** Yes. Install the Mac app on both, and on
-the spare Mac switch the role at the top of the panel to **Be a Display**. It
-shows up on the sending Mac like a phone does and becomes a real extended
-Retina display. Over WiFi it works out of the box. For a cable, connect the two
+**Can another Mac be the display?** Yes. Install **OpenDisplay Receiver**
+(a separate, small app from the same release) on the spare Mac. It only needs
+**macOS 12 Monterey** or newer, so Macs from around 2015 onward qualify even
+though the sending Mac needs macOS 14. The receiver shows up on the sending Mac
+like a phone does and becomes a real extended Retina display. Over WiFi it works out of the box. For a cable, connect the two
 Macs with a **Thunderbolt or USB4 cable** (macOS creates a *Thunderbolt Bridge*
 network between them) or with an **Ethernet** cable or adapters; the sender
 prefers that wired path automatically and the device row says *Cable*. A plain
@@ -203,8 +204,8 @@ on the App Store and lives on GitHub instead.
 ## Install
 
 You need **two apps**: a Mac app (captures and sends) and an iOS app
-(receives and displays). To use a **second Mac** as the display, install the
-Mac app on both and switch the spare one to *Be a Display*; no iOS app needed.
+(receives and displays). To use a **second Mac** as the display, install
+`OpenDisplay Receiver` on it instead of the iOS app.
 
 ### Prebuilt downloads (Mac)
 
@@ -213,6 +214,10 @@ Grab `OpenDisplay.dmg` from the
 The app is signed with a Developer ID certificate and notarized by Apple, so it
 opens with a plain double-click on macOS 14+ — no Gatekeeper warning. Open the
 `.dmg` and drag the app to Applications.
+
+For a Mac that should *be* the display, grab `OpenDisplayReceiver.dmg` from
+the same release instead. It runs on macOS 12+ and is signed and notarized
+the same way; both apps update themselves via Sparkle.
 
 ### iPhone app
 

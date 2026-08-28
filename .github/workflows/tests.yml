@@ -38,3 +38,16 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY=""
+
+      # The receiver app has a much lower deployment target than the sender
+      # (issue #241); building it is what catches an API that only exists on
+      # newer macOS sneaking into Shared/ or the receiver.
+      - name: Build macOS receiver app
+        run: |
+          xcodebuild build \
+            -project OpenSidecar.xcodeproj \
+            -scheme OpenSidecarMacReceiver \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""

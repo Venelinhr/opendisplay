@@ -111,17 +111,23 @@ jobs:
         run: |
           export APP_MARKETING_VERSION="${TAG_NAME#v}"
           bundle exec fastlane mac build_release
+          bundle exec fastlane mac build_receiver_release
 
-      - name: Upload macOS artifact to release
+      # Both Mac apps ship on every release: the sender (macOS 14+) and the
+      # standalone receiver (macOS 12+, issue #241).
+      - name: Upload macOS artifacts to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ needs.release-please.outputs.tag_name }}" \
-            build/export/OpenDisplay.dmg
+            build/export/OpenDisplay.dmg \
+            build/export/OpenDisplayReceiver.dmg
 
-      # --- Sparkle auto-update: generate + publish the appcast (issue #52) ---
-      # Builds appcast.xml from the just-released, notarized DMG and commits it
-      # to public/appcast.xml on main. The Pages workflow (pages.yml) triggers
+      # --- Sparkle auto-update: generate + publish the appcasts (issue #52) ---
+      # Builds appcast.xml (sender) and appcast-receiver.xml (receiver app)
+      # from the just-released, notarized DMGs and commits them to public/ on
+      # main. One feed per app: each bundle has its own SUFeedURL, and a mixed
+      # feed would offer the wrong app's update. The Pages workflow (pages.yml) triggers
       # on public/** changes, copies public/ into docs/ via the Vite build, and
       # deploys it — so https://opendisplay.app/appcast.xml (the SUFeedURL in
       # project.yml) resolves.
@@ -150,16 +156,23 @@ jobs:
           # The EdDSA private key (CI secret) → file for --ed-key-file.
           printf '%s' "$SPARKLE_PRIVATE_KEY" > /tmp/sparkle_ed_priv
 
-          # generate_appcast wants a directory of update archives. Point the
-          # download links at the GitHub Release assets where the DMG lives.
-          mkdir -p /tmp/appcast-updates
+          # generate_appcast wants a directory of update archives per feed.
+          # Point the download links at the GitHub Release assets where the
+          # DMGs live.
+          mkdir -p /tmp/appcast-updates /tmp/appcast-receiver-updates
           cp build/export/OpenDisplay.dmg /tmp/appcast-updates/
+          cp build/export/OpenDisplayReceiver.dmg /tmp/appcast-receiver-updates/
 
           "$GEN_APPCAST" \
             --ed-key-file /tmp/sparkle_ed_priv \
             --download-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/" \
             -o /tmp/appcast-updates/appcast.xml \
             /tmp/appcast-updates
+          "$GEN_APPCAST" \
+            --ed-key-file /tmp/sparkle_ed_priv \
+            --download-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/" \
+            -o /tmp/appcast-receiver-updates/appcast-receiver.xml \
+            /tmp/appcast-receiver-updates
 
           # Commit the feed into public/ on main; Pages picks it up from there.
           git config user.name  "github-actions[bot]"
@@ -168,13 +181,14 @@ jobs:
           git checkout main
           mkdir -p public
           cp /tmp/appcast-updates/appcast.xml public/appcast.xml
+          cp /tmp/appcast-receiver-updates/appcast-receiver.xml public/appcast-receiver.xml
           rm -f /tmp/sparkle_ed_priv
-          git add public/appcast.xml
-          # Compare the STAGED file: plain `git diff` ignores untracked files,
+          git add public/appcast.xml public/appcast-receiver.xml
+          # Compare the STAGED files: plain `git diff` ignores untracked files,
           # so the first-ever appcast (a brand-new public/appcast.xml) looked
           # "unchanged" and was never committed. `--cached` sees the staged add.
-          if ! git diff --cached --quiet -- public/appcast.xml; then
-            git commit -m "chore(release): publish Sparkle appcast for ${TAG_NAME} [skip ci]"
+          if ! git diff --cached --quiet -- public/appcast.xml public/appcast-receiver.xml; then
+            git commit -m "chore(release): publish Sparkle appcasts for ${TAG_NAME} [skip ci]"
             git push origin main
             # Pushes made with GITHUB_TOKEN do NOT trigger other workflows
             # (GitHub blocks recursive runs), so kick the Pages deploy
