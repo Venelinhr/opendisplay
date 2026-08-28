@@ -516,25 +516,38 @@ final class StreamReceiver: ObservableObject {
             let peer = String(describing: conn.endpoint)
             self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
                               || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
-            // Replace any existing connection and reset decoder state.
-            self.connection?.cancel()
-            self.connection = conn
-            self.resetStreamState()
-            self.lastCursorSeq = 0   // the sender restarts its cursor sequence per session
-            self.cursorPortAnnounced = false
-            conn.stateUpdateHandler = { [weak self] state in
-                switch state {
-                case .ready:
-                    self?.lastDataReceived = Date()
-                    self?.setConnected(true)
-                    self?.sendHello(on: conn)
-                case .failed, .cancelled:
-                    self?.setConnected(false)
-                default: break
+            // A Bonjour dial races IPv6 and IPv4 and both handshakes can
+            // complete; the sender cancels its loser within milliseconds.
+            // Adopting every newcomer at once evicted the winner for a
+            // connection that was already dying (seen in the field as a
+            // reset-by-peer storm). With a connection in hand, a newcomer
+            // has to stay alive for a moment before it replaces it.
+            // A closed socket still reads as .ready until a receive hits
+            // EOF, so the proof is bytes: greet the newcomer and adopt it
+            // the moment it streams something back; a socket that closes
+            // or errors first is discarded and the session stays put.
+            if let current = self.connection, current.state != .cancelled,
+               !Self.isFailed(current.state) {
+                conn.stateUpdateHandler = { [weak self] state in
+                    guard let self, case .ready = state else { return }
+                    self.sendHello(on: conn)
+                    conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
+                        [weak self] data, _, isComplete, error in
+                        guard let self else { return }
+                        if let data, !data.isEmpty {
+                            self.adopt(conn, greeted: true, initialData: data)
+                        } else {
+                            Log.info("ignored a twin connection that closed at once"
+                                     + (error.map { " (\($0))" } ?? ""))
+                            conn.cancel()
+                        }
+                        _ = isComplete
+                    }
                 }
+                conn.start(queue: self.queue)
+            } else {
+                self.adopt(conn)
             }
-            conn.start(queue: self.queue)
-            self.receive(on: conn)
         }
         listener?.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
@@ -554,6 +567,48 @@ final class StreamReceiver: ObservableObject {
         }
         listener?.start(queue: queue)
         startCursorListener()
+    }
+
+    /// Make `conn` the session: replace any existing connection and reset
+    /// decoder state. `greeted` marks a newcomer that already got its hello
+    /// while it proved itself (see the listener), with the bytes it sent
+    /// back in `initialData`; a second hello would make the sender rebuild.
+    private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil) {
+        connection?.cancel()
+        connection = conn
+        resetStreamState()
+        lastCursorSeq = 0   // the sender restarts its cursor sequence per session
+        cursorPortAnnounced = false
+        let onReady: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.lastDataReceived = Date()
+            self.setConnected(true)
+            if !greeted { self.sendHello(on: conn) }
+        }
+        conn.stateUpdateHandler = { [weak self] state in
+            guard let self, conn === self.connection else { return }   // replaced: stay quiet
+            switch state {
+            case .ready: onReady()
+            case .failed, .cancelled: self.setConnected(false)
+            default: break
+            }
+        }
+        if conn.state == .ready {
+            onReady()   // already up: the handler will not fire again
+        } else {
+            conn.start(queue: queue)
+        }
+        if let initialData, !initialData.isEmpty {
+            bytesThisWindow += initialData.count
+            buffer.append(initialData)
+            drainFrames()
+        }
+        receive(on: conn)
+    }
+
+    private static func isFailed(_ state: NWConnection.State) -> Bool {
+        if case .failed = state { return true }
+        return false
     }
 
     // MARK: - Liveness (ping + watchdog)
@@ -760,7 +815,9 @@ final class StreamReceiver: ObservableObject {
     private func receive(on conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
             [weak self] data, _, isComplete, error in
-            guard let self else { return }
+            // A replaced connection's last callback must not touch the
+            // session (its EOF used to flip `connected` off for the new one).
+            guard let self, conn === self.connection else { return }
             if let data, !data.isEmpty {
                 self.lastDataReceived = Date()
                 self.bytesThisWindow += data.count
