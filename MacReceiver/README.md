@@ -22,29 +22,24 @@ So a perfectly good 5K display becomes e-waste. This makes it a monitor again.
 
 ---
 
-## Verified setup
-
-Tested end to end on:
+## Tested and validated
 
 | | |
 |---|---|
-| **Sender** | MacBook Pro M4 Pro, macOS 26 |
-| **Receiver** | iMac 27" 2017 — Core i5-7600 (Kaby Lake), Radeon Pro 575 |
-| **Receiver OS** | **macOS Ventura 13.7.8** (the last version this iMac supports) |
-| **Transport** | **Wi-Fi** — no cable, no Thunderbolt |
+| **Resolution** | **5120 × 2880 — 14.7 MP, 1:1 pixels** |
+| **Desktop** | 2560 × 1440 @2x |
+| **Codec** | HEVC Main, 30 Mbit/s |
+| **Latency** | 54 ms median, 62 ms p95 |
+| **Round trip** | 5–6 ms |
+| **Machine** | i5-7600, Radeon Pro 575, **Ventura 13.7.8**, **Wi-Fi** |
 
-### Measured results
+Sender was a MacBook Pro M4 Pro on macOS 26. Colour is captured full-range BGRA;
+Ventura 13.7.8 is the last macOS this iMac supports, which is why it can never run
+the sender itself.
 
-| | |
-|---|---|
-| **Resolution** | **5120 × 2880** (14.7 megapixels, true 5K) |
-| **Desktop** | 2560 × 1440 points @2x |
-| **Scaling** | **None — 1:1 pixel mapping onto the panel** |
-| **Codec** | **HEVC (H.265)**, Main profile |
-| **Bitrate** | 30 Mbit/s |
-| **Colour** | Full-range BGRA capture |
-| **Latency** | **~54 ms median, ~62 ms p95** |
-| **Round trip** | ~5-6 ms |
+**1:1 pixels** is the part that matters: the stream is the same size as the panel,
+so nothing is scaled and nothing is blurred. Every codec and resolution limit
+below was established by end-to-end playback on this hardware, not from spec sheets.
 
 Good for writing, browsing, design tools, reference material, terminals. Not for
 gaming or fast video — that is a Wi-Fi limit, not a code one.
