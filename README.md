@@ -11,7 +11,8 @@
 >
 > | | |
 > |---|---|
-> | **Resolution** | **5120 × 2880 — 14.7 MP, 1:1 pixels** |
+> | **Resolution** | **5120 × 2880 — 14.7 MP** |
+> | **Sharpness** | **1:1 pixels — nothing scaled, nothing blurred** |
 > | **Desktop** | 2560 × 1440 @2x |
 > | **Codec** | HEVC Main, 30 Mbit/s |
 > | **Latency** | 54 ms median, 62 ms p95 |
