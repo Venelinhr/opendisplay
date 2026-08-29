@@ -18,6 +18,13 @@ import QuartzCore
 import CoreVideo
 
 final class MetalVideoRenderer {
+    /// Read once per frame so it can be tuned live from the command line while
+    /// looking at the screen, which is the only sane way to pick a value.
+    static var sharpenAmount: Float {
+        let stored = UserDefaults.standard.object(forKey: "sharpen") as? Double
+        return Float(stored ?? 0.6)
+    }
+
     let metalLayer = CAMetalLayer()
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -51,11 +58,28 @@ final class MetalVideoRenderer {
             o.uv = float2((p[vid].x + 1.0) * 0.5, (1.0 - p[vid].y) * 0.5);
             return o;
         }
+        // Unsharp mask on luma only. The stream is smaller than the panel, so
+        // the GPU magnifies it with bilinear filtering — which is exactly what
+        // "blurry when full screen, sharp in a small window" looks like. Adding
+        // back the high-frequency detail bilinear removes counteracts that.
+        // Chroma is left alone: it is subsampled anyway and sharpening it only
+        // produces colour fringing on text.
         fragment float4 fmain(VOut in [[stage_in]],
                               texture2d<float> texY [[texture(0)]],
-                              texture2d<float> texCbCr [[texture(1)]]) {
+                              texture2d<float> texCbCr [[texture(1)]],
+                              constant float &sharpen [[buffer(0)]]) {
             constexpr sampler s(filter::linear);
             float y = texY.sample(s, in.uv).r;
+            if (sharpen > 0.0) {
+                float2 texel = 1.0 / float2(texY.get_width(), texY.get_height());
+                // 4-tap cross: cheap enough for a 2017 GPU at 5K, and a cross
+                // sharpens strokes without the halo a full 3x3 kernel gives.
+                float blur = 0.25 * (texY.sample(s, in.uv + float2( texel.x, 0)).r
+                                   + texY.sample(s, in.uv + float2(-texel.x, 0)).r
+                                   + texY.sample(s, in.uv + float2(0,  texel.y)).r
+                                   + texY.sample(s, in.uv + float2(0, -texel.y)).r);
+                y = clamp(y + sharpen * (y - blur), 0.0, 1.0);
+            }
             float2 cbcr = texCbCr.sample(s, in.uv).rg;
             float yn = 1.1644 * (y - 0.0627);
             float cb = cbcr.x - 0.5;
@@ -145,6 +169,11 @@ final class MetalVideoRenderer {
         encoder.setRenderPipelineState(pipeline)
         encoder.setFragmentTexture(texY, index: 0)
         encoder.setFragmentTexture(texCbCr, index: 1)
+        // Tunable without a rebuild:
+        //   defaults write com.peetzweg.opensidecar.macreceiver sharpen -float 0.6
+        // 0 disables it; ~0.4-0.8 is the useful band, above ~1.2 it haloes.
+        var sharpen = Self.sharpenAmount
+        encoder.setFragmentBytes(&sharpen, length: MemoryLayout<Float>.size, index: 0)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         encoder.endEncoding()
 

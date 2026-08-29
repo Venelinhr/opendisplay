@@ -1,7 +1,11 @@
 import SwiftUI
 import Network
 import Combine
+// Conditional so the app also builds without the SPM dependency, using the
+// stub in MacSenderShim/SparkleStub.swift. See that file for why.
+#if canImport(Sparkle)
 import Sparkle
+#endif
 
 /// How the app presents itself. One bundle, switched at runtime via the
 /// activation policy — like Raycast/Hammerspoon style background agents.

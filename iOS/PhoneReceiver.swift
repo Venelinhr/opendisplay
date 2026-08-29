@@ -11,7 +11,14 @@ import Network
 import AVFoundation
 import CoreMedia
 import VideoToolbox
+// QuartzCore and ImageIO were previously reaching this file only through UIKit's
+// re-exports; name them so the macOS build (no UIKit) still finds
+// CACurrentMediaTime and the CGImageSource decoders.
+import QuartzCore
+import ImageIO
+#if canImport(UIKit)
 import UIKit
+#endif
 
 /// One-second window of pipeline health, plus per-frame timing samples for
 /// the performance overlay graph.
@@ -68,6 +75,11 @@ final class PhoneReceiver: ObservableObject {
     private var formatDesc: CMVideoFormatDescription?
     private var sps: Data?
     private var pps: Data?
+    // HEVC adds a third parameter set (VPS) and encodes the NAL type in
+    // different bits. Set the first time a VPS is seen; H.264 streams never
+    // touch it, so both codecs work without a handshake.
+    private var vps: Data?
+    private var isHEVC = false
 
     // Liveness: the Mac streams video and pings every 2s; if nothing arrives
     // for 5s the connection is half-open (Mac killed, tunnel died) — drop it
@@ -109,7 +121,9 @@ final class PhoneReceiver: ObservableObject {
     // normalized [0,1] in video space; the sprite arrives as a PNG with its
     // hotspot anchor and size normalized against the Mac display.
     var onCursor: ((_ x: Double, _ y: Double, _ visible: Bool) -> Void)?
-    var onCursorImage: ((_ image: UIImage, _ anchor: CGPoint, _ normSize: CGSize) -> Void)?
+    // CGImage, not UIImage: it is what both consumers actually assign to
+    // CALayer.contents, and it keeps this type toolkit-neutral.
+    var onCursorImage: ((_ image: CGImage, _ anchor: CGPoint, _ normSize: CGSize) -> Void)?
 
     // Metal renderer path (experimental, "metalRenderer" setting): we decode
     // explicitly and hand BGRA buffers out; called on the receiver queue.
@@ -181,7 +195,7 @@ final class PhoneReceiver: ObservableObject {
     /// Update the advertised name and re-publish if already listening.
     func setServiceName(_ name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolved = trimmed.isEmpty ? UIDevice.current.name : trimmed
+        let resolved = trimmed.isEmpty ? ReceiverPlatform.defaultDeviceName : trimmed
         queue.async {
             guard resolved != self.serviceName else { return }
             self.serviceName = resolved
@@ -433,7 +447,8 @@ final class PhoneReceiver: ObservableObject {
         case "cursorImg":
             guard let b64 = obj["png"] as? String,
                   let png = Data(base64Encoded: b64),
-                  let image = UIImage(data: png),
+                  let src = CGImageSourceCreateWithData(png as CFData, nil),
+                  let image = CGImageSourceCreateImageAtIndex(src, 0, nil),
                   let nw = obj["nw"] as? Double, let nh = obj["nh"] as? Double else { return }
             let anchor = CGPoint(x: obj["ax"] as? Double ?? 0, y: obj["ay"] as? Double ?? 0)
             let normSize = CGSize(width: nw, height: nh)
@@ -447,7 +462,7 @@ final class PhoneReceiver: ObservableObject {
                 self.macProtocolVersion = macPV
             }
             if macPV < WireProtocol.minSupportedPeer {
-                let msg = "The OpenDisplay app on your Mac is too old for this \(deviceKind) app. Update OpenDisplay on your Mac to reconnect."
+                let msg = "The OpenDisplay app on your Mac is too old for this \(ReceiverPlatform.deviceKind) app. Update OpenDisplay on your Mac to reconnect."
                 DispatchQueue.main.async { self.peerSignal = .updateMac(message: msg) }
             }
         case WireMessage.updateRequired:
@@ -480,6 +495,8 @@ final class PhoneReceiver: ObservableObject {
         formatDesc = nil
         sps = nil
         pps = nil
+        vps = nil
+        isHEVC = false        // re-detected from the next stream's parameter sets
         lastFrameAt = nil
         frameIntervals.removeAll()
         decodeFlushes = 0
@@ -494,17 +511,28 @@ final class PhoneReceiver: ObservableObject {
 
     // MARK: - Control messages (phone -> Mac)
 
+    /// Largest frame this device can actually decode. Announced so the sender
+    /// can shrink the *encode* without shrinking the *desktop* — the two were
+    /// previously welded together, so asking for a big desktop on modest
+    /// hardware produced a stream it could not play. nil = declare no limit.
+    var maxEncodeWide: Int?
+    var maxEncodeHigh: Int?
+
     private func sendHello(on conn: NWConnection) {
-        sendControl([
+        var hello: [String: Any] = [
             "type": "hello",
             "pixelsWide": devicePixelsWide,
             "pixelsHigh": devicePixelsHigh,
             "scale": deviceScale,
-            "device": UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone",
+            "device": ReceiverPlatform.deviceKind,
             "id": Self.installID,
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
-        ], on: conn)
-        Log.info("hello sent")
+        ]
+        if let maxEncodeWide { hello["maxEncodeWide"] = maxEncodeWide }
+        if let maxEncodeHigh { hello["maxEncodeHigh"] = maxEncodeHigh }
+        sendControl(hello, on: conn)
+        Log.info("hello sent: \(devicePixelsWide)x\(devicePixelsHigh)"
+                 + (maxEncodeWide.map { ", max encode \($0)" } ?? ""))
     }
 
     /// Touch events: x/y normalized [0,1] in video space, origin top-left.
@@ -645,28 +673,100 @@ final class PhoneReceiver: ObservableObject {
         var vclNALUs: [Data] = []
         for nalu in nalus {
             guard let first = nalu.first else { continue }
-            switch first & 0x1F {
-            case 7:                                  // SPS (stream may change
-                if sps != nalu {                     //  size on rotation)
-                    sps = nalu
-                    formatDesc = nil
+
+            // Codec is detected from the stream rather than negotiated: an HEVC
+            // VPS has NAL type 32, which lands in the first byte as 0x40. In
+            // H.264 that byte decodes to type 0, which is unused — so seeing it
+            // is an unambiguous "this is HEVC" and needs no handshake.
+            if !isHEVC, first == 0x40 {
+                isHEVC = true
+                sps = nil; pps = nil; formatDesc = nil
+                Log.info("stream is HEVC — switching parser")
+            }
+
+            if isHEVC {
+                // HEVC packs the type in bits 1-6: (byte >> 1) & 0x3F.
+                let type = (first >> 1) & 0x3F
+                switch type {
+                case 32: if vps != nalu { vps = nalu; formatDesc = nil }   // VPS
+                case 33: if sps != nalu { sps = nalu; formatDesc = nil }   // SPS
+                case 34: if pps != nalu { pps = nalu; formatDesc = nil }   // PPS
+                default:
+                    // Only types 0-31 are VCL (actual picture slices). 35-40 are
+                    // AUD / EOS / EOB / filler / SEI, and HEVC emits an AUD before
+                    // each access unit where H.264 does not — feeding those to the
+                    // decoder as if they were slice data corrupts every frame,
+                    // which is why nothing rendered.
+                    if type < 32 { vclNALUs.append(nalu) }
                 }
-            case 8:                                  // PPS
-                if pps != nalu {
-                    pps = nalu
-                    formatDesc = nil
+            } else {
+                switch first & 0x1F {
+                case 7:                                  // SPS (stream may change
+                    if sps != nalu {                     //  size on rotation)
+                        sps = nalu
+                        formatDesc = nil
+                    }
+                case 8:                                  // PPS
+                    if pps != nalu {
+                        pps = nalu
+                        formatDesc = nil
+                    }
+                case 6: break                            // SEI — skip
+                default: vclNALUs.append(nalu)           // slice data
                 }
-            case 6: break                            // SEI — skip
-            default: vclNALUs.append(nalu)           // slice data
             }
         }
-        if formatDesc == nil, let sps, let pps {
-            displayLayer.flush()   // drop any frames from the previous format
-            buildFormatDescription(sps: sps, pps: pps)
+        if formatDesc == nil {
+            if isHEVC, let vps, let sps, let pps {
+                displayLayer.flush()
+                buildHEVCFormatDescription(vps: vps, sps: sps, pps: pps)
+            } else if !isHEVC, let sps, let pps {
+                displayLayer.flush()   // drop any frames from the previous format
+                buildFormatDescription(sps: sps, pps: pps)
+            }
         }
         guard !vclNALUs.isEmpty else { return }
         // All slices of one wire frame go into ONE sample buffer.
         enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs)
+    }
+
+    /// HEVC needs all three parameter sets and its own constructor. Everything
+    /// downstream — the AVCC length-prefix repacking, the sample buffers, the
+    /// display layer and the decompression session — is codec-agnostic.
+    private func buildHEVCFormatDescription(vps: Data, sps: Data, pps: Data) {
+        let sets = [vps, sps, pps]
+        var buffers: [UnsafeMutablePointer<UInt8>] = []
+        defer { buffers.forEach { $0.deallocate() } }
+
+        var pointers: [UnsafePointer<UInt8>] = []
+        var sizes: [Int] = []
+        for set in sets {
+            let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: set.count)
+            set.copyBytes(to: buf, count: set.count)
+            buffers.append(buf)
+            pointers.append(UnsafePointer(buf))
+            sizes.append(set.count)
+        }
+
+        let status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+            allocator: kCFAllocatorDefault,
+            parameterSetCount: 3,
+            parameterSetPointers: pointers,
+            parameterSetSizes: sizes,
+            nalUnitHeaderLength: 4,
+            extensions: nil,
+            formatDescriptionOut: &formatDesc
+        )
+        if status == noErr, let formatDesc {
+            let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
+            Log.info("HEVC format description built: \(dims.width)x\(dims.height)")
+            DispatchQueue.main.async {
+                self.videoSize = CGSize(width: Int(dims.width), height: Int(dims.height))
+            }
+            setStatus("Receiving \(dims.width)×\(dims.height)")
+        } else {
+            Log.info("HEVC format description FAILED: \(status)")
+        }
     }
 
     private func buildFormatDescription(sps: Data, pps: Data) {

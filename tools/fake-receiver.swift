@@ -7,6 +7,12 @@ import Network
 let port: UInt16 = 9000
 let listener = try! NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: port)!)
 
+// Advertise over Bonjour so the Mac sender discovers us the same way a real
+// receiver is discovered. Without this the sender has nothing to dial.
+listener.service = NWListener.Service(name: "Fake 5K Receiver",
+                                      type: "_opensidecar._tcp",
+                                      txtRecord: NWTXTRecord(["id": "FAKE-3", "pv": "3"]))
+
 func frame(_ json: String) -> Data {
     let payload = Data(json.utf8)
     var header = UInt32(payload.count).bigEndian
@@ -18,25 +24,49 @@ func frame(_ json: String) -> Data {
 // Pass "rotate" as arg 1 to announce a portrait re-hello 20s after connect
 // (and back to landscape at 45s) — simulates device rotation for testing
 // the Mac's rebuild path without physical hardware.
-let simulateRotation = CommandLine.arguments.dropFirst().first == "rotate"
+let args = Array(CommandLine.arguments.dropFirst())
+let simulateRotation = args.first == "rotate"
+
+// Pass "--hello WxH" to announce a different panel size, e.g. an iMac 27" 5K:
+//     swift tools/fake-receiver.swift --hello 5120x2880
+// The sender derives desktop points as pixels/2 and encodes at points*2*quality,
+// so this is the lever that decides whether VTCompressionSessionCreate survives.
+var helloW = 2732, helloH = 2048, helloDevice = "iPad"
+if let i = args.firstIndex(of: "--hello"), i + 1 < args.count {
+    let parts = args[i + 1].lowercased().split(separator: "x")
+    if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]) {
+        helloW = w; helloH = h; helloDevice = "Mac"
+    } else {
+        print("bad --hello value '\(args[i + 1])' — expected WxH, e.g. 5120x2880")
+        exit(1)
+    }
+}
+
+func helloJSON(_ w: Int, _ h: Int) -> String {
+    "{\"type\":\"hello\",\"pixelsWide\":\(w),\"pixelsHigh\":\(h),\"scale\":2,"
+    + "\"device\":\"\(helloDevice)\",\"id\":\"FAKE-3\",\"pv\":3}"
+}
+
+print("announcing \(helloW)x\(helloH) as \"\(helloDevice)\" "
+      + "-> expect a \(helloW / 2)x\(helloH / 2) point desktop")
 
 listener.newConnectionHandler = { conn in
     print("connection from \(conn.endpoint)")
     var frames = 0, bytes = 0
     var windowStart = Date()
     conn.start(queue: .global())
-    // iPad Pro 12.9" panel: 2732x2048 @2x
-    conn.send(content: frame("{\"type\":\"hello\",\"pixelsWide\":2732,\"pixelsHigh\":2048,\"scale\":2,\"device\":\"iPad\",\"id\":\"FAKE-3\"}"),
+    // Default is an iPad Pro 12.9" panel (2732x2048 @2x); --hello overrides it.
+    conn.send(content: frame(helloJSON(helloW, helloH)),
               completion: .contentProcessed { _ in })
     if simulateRotation {
         DispatchQueue.global().asyncAfter(deadline: .now() + 20) {
             print("simulating rotation -> portrait")
-            conn.send(content: frame("{\"type\":\"hello\",\"pixelsWide\":2048,\"pixelsHigh\":2732,\"scale\":2,\"device\":\"iPad\",\"id\":\"FAKE-3\"}"),
+            conn.send(content: frame(helloJSON(helloH, helloW)),
                       completion: .contentProcessed { _ in })
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + 45) {
             print("simulating rotation -> landscape")
-            conn.send(content: frame("{\"type\":\"hello\",\"pixelsWide\":2732,\"pixelsHigh\":2048,\"scale\":2,\"device\":\"iPad\",\"id\":\"FAKE-3\"}"),
+            conn.send(content: frame(helloJSON(helloW, helloH)),
                       completion: .contentProcessed { _ in })
         }
     }

@@ -39,10 +39,18 @@ enum StreamQuality: String, CaseIterable {
     }
 
     var bitrate: Int {
+        // Tunable without a rebuild:
+        //   defaults write com.peetzweg.opensidecar.mac bitrateMbps -int 40
+        if let mbps = UserDefaults.standard.object(forKey: "bitrateMbps") as? Int, mbps > 0 {
+            return mbps * 1_000_000
+        }
+        // Raised from 18/10/6: mirror now captures at native pixel resolution,
+        // which is 4x the pixels of the old point-sized capture. At the old
+        // bitrate that traded softness for blockiness instead of fixing it.
         switch self {
-        case .best: return 18_000_000
-        case .balanced: return 10_000_000
-        case .fast: return 6_000_000
+        case .best: return 32_000_000
+        case .balanced: return 18_000_000
+        case .fast: return 9_000_000
         }
     }
 
@@ -73,9 +81,26 @@ struct PhoneInfo: Decodable {
                           // across USB and WiFi
     let pv: Int?          // receiver protocol version (issue #132); absent on
                           // every pre-handshake install → treat as protocol 1
+    // The widest/tallest frame this receiver can actually decode. Lets a
+    // receiver ask for a large DESKTOP without also demanding a stream its
+    // hardware chokes on — an iMac 27" 2017 wants 2560x1440 points but tops out
+    // near 3840x2160 of H.264. Optional, so older receivers are unaffected
+    // (PROTOCOL.md §6: unknown fields are ignored, so this needs no pv bump).
+    let maxEncodeWide: Int?
+    let maxEncodeHigh: Int?
 
     var kind: String { device ?? "device" }
     var protocolVersion: Int { pv ?? WireProtocol.assumedWhenAbsent }
+}
+
+/// Shrink a capture size to the receiver's declared decode ceiling, preserving
+/// aspect ratio. Without a ceiling this is just the existing even-rounding.
+func clampCapture(_ w: Int, _ h: Int, to info: PhoneInfo) -> (w: Int, h: Int) {
+    guard let maxW = info.maxEncodeWide, maxW > 0, w > maxW else {
+        return (w & ~1, h & ~1)
+    }
+    let scaledH = Int(Double(h) * Double(maxW) / Double(w))
+    return (maxW & ~1, scaledH & ~1)
 }
 
 /// How the sender reaches the receiver. Reconnects re-dial from scratch, so
@@ -330,9 +355,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 throw NSError(domain: "MacSender", code: 1,
                               userInfo: [NSLocalizedDescriptionKey: "no displays found"])
             }
-            // SCDisplay reports points; capture at point resolution for M1.
-            let captureW = (Int(Double(display.width) * quality.scale)) & ~1
-            let captureH = (Int(Double(display.height) * quality.scale)) & ~1
+            // SCDisplay reports POINTS, not pixels. Capturing at point size threw
+            // away half the detail on a Retina panel — a 1728x1116 stream from a
+            // display macOS actually renders at 3456x2232 — which on a 5K receiver
+            // reads as a permanently soft picture that no quality setting fixes.
+            //
+            // CGDisplayMode.pixelWidth/Height give the real backing store, so
+            // "Best" now genuinely means native. Falls back to 2x if the mode is
+            // unavailable, and to the old point size for a non-Retina display.
+            let mode = CGDisplayCopyDisplayMode(display.displayID)
+            let nativeW = mode?.pixelWidth ?? display.width * 2
+            let nativeH = mode?.pixelHeight ?? display.height * 2
+            let captureW = (Int(Double(max(nativeW, display.width)) * quality.scale)) & ~1
+            let captureH = (Int(Double(max(nativeH, display.height)) * quality.scale)) & ~1
+            Log.info("mirror capture: \(display.width)x\(display.height)pt -> \(captureW)x\(captureH)px")
             try await startCapture(display: display, pixelsWide: captureW, pixelsHigh: captureH)
 
         case .extend:
@@ -487,8 +523,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         inputInjector = InputInjector(displayID: vd.displayID)
         // Quality scaling: capture/encode below native when requested — the
         // display itself stays native so window layout is unaffected.
-        let captureW = (Int(Double(pointsWide * 2) * quality.scale)) & ~1
-        let captureH = (Int(Double(pointsHigh * 2) * quality.scale)) & ~1
+        // Clamped to the receiver's decode ceiling: the desktop stays as large as
+        // it asked for, only the encoded frame shrinks.
+        let (captureW, captureH) = clampCapture(Int(Double(pointsWide * 2) * quality.scale),
+                                                Int(Double(pointsHigh * 2) * quality.scale),
+                                                to: info)
         try await startCapture(display: display, pixelsWide: captureW, pixelsHigh: captureH)
 
         // Debug aid (`defaults write sh.peet.opensidecar.mac testPattern -bool true`):
@@ -562,8 +601,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         guard didResize else { return false }
 
         let display = try await findSCDisplay(id: vd.displayID, expectedSize: size)
-        let captureW = (Int(Double(pointsWide * 2) * quality.scale)) & ~1
-        let captureH = (Int(Double(pointsHigh * 2) * quality.scale)) & ~1
+        // Clamped to the receiver's decode ceiling: the desktop stays as large as
+        // it asked for, only the encoded frame shrinks.
+        let (captureW, captureH) = clampCapture(Int(Double(pointsWide * 2) * quality.scale),
+                                                Int(Double(pointsHigh * 2) * quality.scale),
+                                                to: info)
         try await startCapture(display: display, pixelsWide: captureW, pixelsHigh: captureH)
         inputInjector = InputInjector(displayID: vd.displayID)
 
@@ -1342,6 +1384,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Create the compression session into `encoder`, optionally requiring an
     /// encoder that supports low-latency rate control.
+    /// HEVC is the only way to exceed 4K: H.264 hardware encode and decode both
+    /// stop below 5120 wide on every Mac tested, including Apple silicon, while
+    /// HEVC handles 5120x2880 on both a 2026 MacBook Pro and a 2017 iMac.
+    /// Enabled with `defaults write com.peetzweg.opensidecar.mac hevc -bool YES`.
+    static var useHEVC: Bool { UserDefaults.standard.bool(forKey: "hevc") }
+
     private func createCompressionSession(width: Int, height: Int, lowLatency: Bool) -> OSStatus {
         let spec: CFDictionary? = lowLatency
             ? [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue] as CFDictionary
@@ -1349,7 +1397,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         return VTCompressionSessionCreate(
             allocator: nil,
             width: Int32(width), height: Int32(height),
-            codecType: kCMVideoCodecType_H264,
+            codecType: Self.useHEVC ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
             encoderSpecification: spec,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
@@ -1395,7 +1443,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // Low-latency settings: real-time, no B-frames, periodic keyframes.
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
+        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ProfileLevel,
+                             value: Self.useHEVC ? kVTProfileLevel_HEVC_Main_AutoLevel
+                                                 : kVTProfileLevel_H264_High_AutoLevel)
         // No periodic IDRs: each one is a bitrate spike → transmit-time hiccup.
         // TCP never loses data, and we force a keyframe on reconnect/drop.
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 3600 as CFNumber)
@@ -1405,7 +1455,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
         VTCompressionSessionPrepareToEncodeFrames(encoder)
-        Log.info("encoder ready: \(width)x\(height) H.264 \(quality.bitrate / 1_000_000)Mbps quality=\(quality.rawValue) lowLatencyRC=\(lowLatency && !usedFallback)\(usedFallback ? " (fallback)" : "")")
+        Log.info("encoder ready: \(width)x\(height) \(Self.useHEVC ? "HEVC" : "H.264") \(quality.bitrate / 1_000_000)Mbps quality=\(quality.rawValue) lowLatencyRC=\(lowLatency && !usedFallback)\(usedFallback ? " (fallback)" : "")")
     }
 
     // MARK: - Capture callback
@@ -1653,15 +1703,27 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         var out = Data(capacity: total + 128)
         // On keyframes, prepend SPS/PPS (they live in the format description).
         if isKeyframe(sample), let fmt = CMSampleBufferGetFormatDescription(sample) {
-            for i in 0..<2 {           // index 0 = SPS, 1 = PPS
+            // H.264 carries two parameter sets (SPS, PPS); HEVC carries three
+            // (VPS, SPS, PPS) and needs its own accessor — the H.264 one returns
+            // an error for an HEVC format description rather than serving it.
+            // Getting this wrong emits a stream with NO headers, which no decoder
+            // can start from: the receiver just shows black forever.
+            let hevc = Self.useHEVC
+            for i in 0..<(hevc ? 3 : 2) {
                 var psPtr: UnsafePointer<UInt8>?
                 var psLen = 0
-                if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                let status = hevc
+                    ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
                         fmt, parameterSetIndex: i,
                         parameterSetPointerOut: &psPtr,
                         parameterSetSizeOut: &psLen,
-                        parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr,
-                   let psPtr {
+                        parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+                    : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                        fmt, parameterSetIndex: i,
+                        parameterSetPointerOut: &psPtr,
+                        parameterSetSizeOut: &psLen,
+                        parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+                if status == noErr, let psPtr {
                     out.append(contentsOf: startCode)
                     out.append(Data(bytes: psPtr, count: psLen))
                 }
