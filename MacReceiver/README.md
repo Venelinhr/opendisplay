@@ -127,7 +127,13 @@ Restart both apps afterwards — settings are read at launch.
 
 The older Mac now has its own desktop.
 
-- **Move windows there** by dragging past the screen edge.
+- **Move a window there** — hover over its **green button** (don't click) and pick
+  **"Move to OpenDisplay — …"**. This is the reliable way; dragging across the
+  edge also works but has two traps below.
+- **A full-screen window will never move**, however hard you drag — macOS pins it
+  to its own Space. Leave full screen first (`Ctrl-Cmd-F`), then move it.
+- **Grab the title bar, not a tab.** Dragging a browser tab tears it into a new
+  window, which then reopens on the original screen.
 - **Set the position** with *Arrange Displays…* so the edge you cross matches
   where the machine physically sits.
 - **Full screen** on the receiver: `Ctrl-Cmd-F`. `Esc` exits.
