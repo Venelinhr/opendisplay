@@ -6,10 +6,15 @@
 
 **Turn your spare Apple devices into second monitors for your Mac — free, open source, no subscription.**
 
-iPhone and iPad today, spare MacBooks on the roadmap. A self-hosted
+iPhone, iPad — **and now a spare Mac**. A self-hosted
 alternative to Apple Sidecar, Duet Display, and Luna Display: true extended
 display (not just mirroring), Retina-sharp, over USB or WiFi, with touch and
 scroll input.
+
+**Old Macs work too.** An **iMac 27" 2017 (Retina 5K)** runs as a receiver at its
+full **5120 × 2880**, 1:1 pixels over Wi-Fi — a machine that otherwise cannot be a
+display at all, since Target Display Mode was removed after 2014 and AirPlay-to-Mac
+needs a 2019+ model. See [macOS receiver](MacReceiver/README.md).
 
 [Website](https://peetzweg.github.io/opendisplay/) · [Quick start](#quick-start) · [How it works](#how-it-works) · [FAQ](#faq) · [Contributing](#contributing)
 
@@ -41,6 +46,10 @@ pipeline, USB transport, input injection) are already working.
 
 ## Features
 
+- 🖥️ **A spare Mac as a display** — not just iPhone and iPad. Verified on an
+  **iMac 27" 2017** at true **5120 × 2880** over Wi-Fi, 1:1 pixels with no
+  scaling. Runs on macOS 13+, Intel or Apple silicon, so Macs too old for the
+  sender can still be receivers. ([details](MacReceiver/README.md))
 - 🖥️ **True display extension** — macOS treats the device as a real second
   monitor (drag windows to it, arrange it in System Settings), not a mirror.
   Mirroring is also available as a mode.
@@ -104,6 +113,17 @@ adapters.
 **Does it support iPad?** The receiver app is universal (iPhone + iPad);
 iPad is the same codebase. iPad-specific polish (Pencil, pressure) is on the
 roadmap.
+
+**Can I use an old Mac as the display?** Yes — see
+[MacReceiver/README.md](MacReceiver/README.md). The receiver needs macOS 13+ and
+runs on Intel or Apple silicon; the *sender* still needs macOS 14+, so an older
+Mac can be the display but not the source. A 2017 iMac 27" reaches its full
+5120 × 2880 this way.
+
+**Why does 5K need HEVC?** H.264 hardware decode stops below 5120 wide on every
+Mac tested, including Apple silicon — it is a format ceiling, not an age limit.
+HEVC handles 5120 × 2880 on hardware as old as 2017 Kaby Lake. Enable it with
+`defaults write com.peetzweg.opensidecar.mac hevc -bool YES`.
 
 **Why H.264 and not HEVC/AV1?** Hardware H.264 encode/decode is universally
 fast and the latency is excellent. HEVC is a planned option for better
