@@ -1,3 +1,34 @@
+> ### This fork adds a **macOS receiver** — use an old Mac as a second display
+>
+> Upstream OpenDisplay turns an iPad or iPhone into a second monitor. This fork adds
+> a receiver for **macOS**, so an older Mac can be one too.
+>
+> Built for an **iMac 27" 2017 (Retina 5K)**, which has no other way to do this:
+> Target Display Mode was removed after 2014, AirPlay-to-Mac needs a 2019+ model,
+> and the sender itself requires macOS 14 while this iMac stops at Ventura 13.
+>
+> **Tested and validated:**
+>
+> | | |
+> |---|---|
+> | **Resolution** | **5120 × 2880 — 14.7 MP, 1:1 pixels** |
+> | **Desktop** | 2560 × 1440 @2x |
+> | **Codec** | HEVC Main, 30 Mbit/s |
+> | **Latency** | 54 ms median, 62 ms p95 |
+> | **Round trip** | 5–6 ms |
+> | **Machine** | i5-7600, Radeon Pro 575, Ventura 13.7.8, Wi-Fi |
+>
+> ### ⬇️ [Download the apps](../../releases/latest) &nbsp;·&nbsp; 📖 [Setup guide](../../blob/imac-27-5k-receiver/MacReceiver/README.md) &nbsp;·&nbsp; 🔧 [Source branch](../../tree/imac-27-5k-receiver)
+>
+> Also fixes three bugs that affect **all** users: mirror captured at half
+> resolution, HEVC emitted with no stream headers, and HEVC frames corrupted by
+> delimiter data. Offered upstream as
+> [peetzweg/opendisplay#253](https://github.com/peetzweg/opendisplay/pull/253).
+>
+> Everything below is the original project's README.
+
+---
+
 <div align="center">
 
 <img src="public/logo.png" width="128" alt="OpenDisplay app icon" />
